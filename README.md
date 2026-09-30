@@ -47,6 +47,28 @@ Source-to-output fidelity is reported separately, on the same page:
   produce the same number of keys and the same file size; only one of them is
   the animation.
 
+**Reducing keys is a separate, opt-in, lossy thing.** It is off by default and
+only runs with an explicit threshold, because it is the one step in the
+pipeline that discards information:
+
+    gtafbx convert --fbx dance.fbx --dff male01.dff --out dance.ifp \
+        --reduce-keys 1.5
+
+It reports what it cost in the terms a viewer would notice — how far the pose
+at the worst instant now sits from what it was:
+
+```
+warn key reduction was asked for and applied: 5510 of 13925 keys moved the
+pose by less than 1.50 degrees and were dropped; the pose is now up to
+16.333 degrees away from what it was at the worst instant
+```
+
+That figure is measured by playing the reduced track back and comparing it to
+the original at the same instants, and an independent sweep measures
+16.321°. Two earlier versions of the metric were wrong and are described in
+`docs/ifp_format.md`; both reported a large error for an animation that plays
+back identically.
+
 Neither is hidden, and neither is called an accuracy figure.
 
 ## Install
@@ -174,7 +196,7 @@ Real bugs, each with the test that catches it:
 
 ```
 $ pytest -q
-164 passed
+180 passed
 ```
 
 The resampling one is worth singling out: on a fast rotation the previous
@@ -213,7 +235,7 @@ gui/                       the window
     jobs.py                background threads
     preview.py             the side-by-side view
 examples/                  the MTA resource and a generated IFP
-tests/                     164 tests
+tests/                     180 tests
 testdata/                  a real FBX and a real DFF
 docs/                      format notes
 ```

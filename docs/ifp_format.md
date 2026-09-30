@@ -75,3 +75,31 @@ number at all.
   — the structures the engine actually uses
 - <https://gtaforums.com/topic/400901-creating-custom-ifps/> — `OffsetEOF` is
   relative to byte 8
+
+## Key reduction, and two wrong ways to measure it
+
+Dropping keys is opt-in (`--reduce-keys DEG`) and is the only lossy step in
+the pipeline. Resampling is not lossy; dropping is.
+
+Measuring what a reduction costs took three attempts, and the two failures are
+worth recording because both produce a confident, large, meaningless number.
+
+**The angle a dropped key makes with the chord between its neighbours.**
+Large by construction — a dropped key *is* the corner being cut — and it grows
+with how sharply the motion turns rather than with how wrong the result
+looks. It reported 17.7° on a clip whose stored keys all sit exactly on the
+original path.
+
+**The deviation at the kept keys.** Exactly zero, always, for every reduction
+ever performed: a kept key is the original key by construction. It looked
+like a broken metric, and would have been read as "reduction is free".
+
+**What it actually is.** Play the reduced track the way the game does and
+compare with the original at the same instants, sampling *between* the kept
+keys, because that is where the deviation lives. On the Samba clip at a 1.5°
+threshold the tool reports 16.333° and an independent sweep measures 16.321°.
+
+A related trap: on a constant-rate rotation about a fixed axis the answer is
+genuinely zero, because such a path is a great circle and slerp traces a great
+circle exactly. That is not the metric being broken; a test pins it so the
+zero is known to be earned.

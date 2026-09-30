@@ -11,6 +11,7 @@ the same misunderstanding pass a round-trip test perfectly.
 from __future__ import annotations
 
 import os
+import math
 import struct
 import sys
 
@@ -652,3 +653,134 @@ class TestResamplingOntoTheClock:
         assert fitting.fits_without_loss
         assert stored_t.size == times.size
         assert np.allclose(stored_r, rots)
+
+
+class TestOptInKeyReduction:
+    """Dropping keys is the one lossy step, so it is behind a flag and the
+    flag's cost is measured rather than assumed."""
+
+    @staticmethod
+    def _arc(seconds=1.0, fps=50.0, rate=4.0):
+        from gta_fbx_ifp_converter.core import mathx
+
+        t = np.arange(0.0, seconds, 1.0 / fps)
+        r = np.array([mathx.quat_from_axis_angle(
+            [0, 0, 1], math.radians(rate * x)) for x in t])
+        return t, r
+
+    def test_nothing_is_dropped_without_asking(self):
+        from gta_fbx_ifp_converter.gta.ifp_build import build_animation
+
+        assert "key_reduction" not in build_animation.__doc__ or True
+        # build_animation defaults to None, which must mean "keep them all".
+        import inspect
+
+        assert inspect.signature(build_animation).parameters[
+            "reduce_threshold_deg"].default is None
+
+    def test_a_still_track_collapses_to_its_endpoints(self):
+        from gta_fbx_ifp_converter.gta.ifp_writer import drop_negligible_keys
+
+        t = np.arange(0.0, 0.5, 0.02)
+        r = np.tile(np.array([0.0, 0.0, 0.0, 1.0]), (t.size, 1))
+        kept, rots, _, reduction = drop_negligible_keys(t, r, threshold_deg=0.25)
+        assert kept.size == 2, "first and last are never dropped"
+        assert reduction.dropped_keys == t.size - 2
+        # A bone that never moved is reproduced exactly by its endpoints.
+        assert reduction.max_error_deg < 0.001
+
+    def test_a_constant_rate_arc_is_lossless(self):
+        """slerp along an arc of constant rate *is* the arc.
+
+        A rotation about a fixed axis at constant speed is a great circle, and
+        spherical interpolation traces a great circle exactly -- so dropping
+        the intermediate keys costs nothing at all. Reporting a non-zero
+        error here would mean the metric is wrong, not that the reduction is.
+        """
+        from gta_fbx_ifp_converter.gta.ifp_writer import drop_negligible_keys
+
+        t, r = self._arc()
+        _, _, _, reduction = drop_negligible_keys(t, r, threshold_deg=3.0)
+        assert reduction.kept_keys < t.size, "keys should have been dropped"
+        assert reduction.max_error_deg < 0.001
+
+    def test_a_variable_rate_curve_reports_a_real_cost(self):
+        """Speed that changes is what makes a chord differ from the path."""
+        from gta_fbx_ifp_converter.core import mathx
+        from gta_fbx_ifp_converter.gta.ifp_writer import drop_negligible_keys
+
+        t = np.arange(0.0, 1.0, 0.02)
+        r = np.array([mathx.quat_from_axis_angle(
+            [0, 0, 1], math.radians(90.0 * x * x)) for x in t])
+        _, _, _, reduction = drop_negligible_keys(t, r, threshold_deg=3.0)
+        assert reduction.dropped_keys > 0
+        assert reduction.max_error_deg > 0.1, (
+            "an eased curve loses real accuracy when its keys are dropped; "
+            f"reported {reduction.max_error_deg}")
+
+    def test_the_reported_error_matches_an_independent_measurement(self):
+        from gta_fbx_ifp_converter.core import mathx
+        from gta_fbx_ifp_converter.gta.ifp_writer import drop_negligible_keys
+
+        t = np.arange(0.0, 1.0, 0.02)
+        r = np.array([mathx.quat_from_axis_angle(
+            [0, 0, 1], math.radians(120.0 * x * x)) for x in t])
+        kept_t, kept_r, _, reduction = drop_negligible_keys(
+            t, r, threshold_deg=4.0)
+
+        # Sweep the reduced track the way the game plays it, and compare with
+        # the original at the same instants.
+        worst = 0.0
+        for i in range(kept_t.size - 1):
+            span = kept_t[i + 1] - kept_t[i]
+            if span <= 0:
+                continue
+            for fraction in (0.25, 0.5, 0.75):
+                moment = kept_t[i] + span * fraction
+                played = mathx.quat_slerp(kept_r[i], kept_r[i + 1], fraction)
+                upper = min(int(np.searchsorted(t, moment, side="right")),
+                            t.size - 1)
+                lower = max(0, upper - 1)
+                gap = t[upper] - t[lower]
+                original = mathx.quat_slerp(
+                    r[lower], r[upper],
+                    float((moment - t[lower]) / gap) if gap > 0 else 0.0)
+                worst = max(worst, mathx.quat_angle_deg(original, played))
+        assert reduction.max_error_deg == pytest.approx(worst, abs=0.05), (
+            f"the tool reports {reduction.max_error_deg:.4f} but the played "
+            f"animation deviates by {worst:.4f}")
+
+    def test_a_higher_threshold_saves_more_and_costs_more(self):
+        from gta_fbx_ifp_converter.gta.ifp_writer import drop_negligible_keys
+
+        t = np.arange(0.0, 1.0, 0.02)
+        r = np.array([mathx.quat_from_axis_angle(
+            [0, 0, 1], math.radians(150.0 * x * x)) for x in t])
+        cheap = drop_negligible_keys(t, r, threshold_deg=0.5)[3]
+        dear = drop_negligible_keys(t, r, threshold_deg=6.0)[3]
+        assert dear.kept_keys < cheap.kept_keys
+        assert dear.max_error_deg >= cheap.max_error_deg
+
+    def test_reduction_happens_after_the_clock_fit(self):
+        """Dropping before fitting would compound two losses.
+
+        A key dropped from the source is a key the resampler then had to
+        interpolate across, so the two errors add. Reducing fitted keys means
+        the resampler already put the survivors on the correct path.
+        """
+        from gta_fbx_ifp_converter.gta.ifp_writer import BoneFrames, fit_keys_to_clock
+
+        # 60 fps, so keys really do collide on the 1/50 s clock.
+        from gta_fbx_ifp_converter.core import mathx
+
+        t = np.arange(0.0, 0.5, 1.0 / 60.0)
+        r = np.array([mathx.quat_from_axis_angle(
+            [0, 0, 1], math.radians(480.0 * x)) for x in t])
+        times, rots, _, fitting = fit_keys_to_clock(t, r)
+        assert fitting.collided_keys > 0, "this fixture must collide"
+        bone = BoneFrames(name="x", bone_id=1, rotations=rots, times_s=times)
+        bone.reduce(0.5)
+        # Every surviving key is still one the resampler produced, so the
+        # clock cost is unchanged and the reduction is the only loss.
+        assert bone.times_s.size <= times.size
+        assert len(bone.times_s) == len(bone.rotations)

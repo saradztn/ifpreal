@@ -24,6 +24,7 @@ import numpy as np
 from ..retarget.transfer import BoneTrack, RetargetReport
 from .ifp_writer import (
     TIME_UNITS_PER_SECOND,
+    KeyReduction,
     Animation,
     BoneFrames,
     IfpWriteError,
@@ -44,6 +45,8 @@ class BuildResult:
     warnings: list[str] = field(default_factory=list)
     #: What the format's 1/50 s clock cost, once the animation is built.
     time_fitting: "TimeFitting | None" = None
+    #: What opt-in key reduction cost.  ``None`` means it was not asked for.
+    key_reduction: "KeyReduction | None" = None
 
     @property
     def is_complete(self) -> bool:
@@ -58,6 +61,8 @@ class BuildResult:
         ]
         if self.time_fitting is not None:
             lines.append(f"  {self.time_fitting.describe()}")
+        if self.key_reduction is not None:
+            lines.append(f"  {self.key_reduction.describe()}")
         for name, reason in self.skipped:
             lines.append(f"  skipped {name!r}: {reason}")
         return "\n".join(lines)
@@ -102,6 +107,7 @@ def build_animation(
     report: RetargetReport,
     skeleton,
     internal_name: str | None = None,
+    reduce_threshold_deg: float | None = None,
 ) -> BuildResult:
     """Assemble one IFP animation from a retarget report.
 
@@ -167,6 +173,16 @@ def build_animation(
     # than being handed a file that quietly runs slow.
     fitting = result.animation.fit()
     result.time_fitting = fitting
+
+    # Opt-in only.  `None` -- the default -- keeps every key the resampler
+    # stored, because resampling is lossless and dropping is not.
+    if reduce_threshold_deg is not None:
+        result.key_reduction = result.animation.reduce(reduce_threshold_deg)
+        if not result.key_reduction.fits_without_loss:
+            result.warnings.append(
+                f"key reduction was asked for and applied: "
+                f"{result.key_reduction.describe()}"
+            )
     if not fitting.fits_without_loss:
         result.warnings.append(
             f"time keys had to be reduced: {fitting.describe()}. The "

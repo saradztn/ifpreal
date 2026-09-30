@@ -252,8 +252,12 @@ def convert(source: dict[str, Any], target: dict[str, Any],
     )
 
     report("Writing IFP", settings["block_name"], 0.7)
+    # `None` unless the user ticked the box.  Off by default because it is
+    # the one lossy step in the pipeline.
+    threshold = settings.get("threshold") if settings.get("reduce") else None
     built = build_animation(settings["block_name"], retarget, skeleton,
-                            settings["block_name"])
+                            settings["block_name"],
+                            reduce_threshold_deg=threshold)
     if built.animation is None:
         raise ValueError("nothing could be written: " + "; ".join(built.warnings))
     written = write_ifp(out_path, [built.animation], settings["block_name"])
@@ -276,6 +280,8 @@ def convert(source: dict[str, Any], target: dict[str, Any],
         "passed": validation.passed,
         "diagnostics": [f.to_dict() for f in diagnostics.findings],
         "clean": diagnostics.is_clean,
+        "key_reduction": (built.key_reduction.to_dict()
+                          if built.key_reduction is not None else None),
         "unit_scale": correction.unit_scale,
         "measured_fraction": correction.measured_fraction,
         "root_travel_s": retarget.root_travel_s,

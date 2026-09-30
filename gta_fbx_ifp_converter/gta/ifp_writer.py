@@ -262,6 +262,161 @@ def _evaluate_rotation(
     return mathx.quat_slerp(rotations[lower], rotations[upper], float(blend))
 
 
+def drop_negligible_keys(
+    times_s: Sequence[float],
+    rotations: np.ndarray,
+    translations: np.ndarray | None = None,
+    threshold_deg: float = 0.25,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray | None, KeyReduction]:
+    """Drop keys whose pose is within `threshold_deg` of the previous one.
+
+    This is opt-in because it is lossy.  Resampling onto the format's clock
+    (:func:`fit_keys_to_clock`) is not: every stored key lands on the path
+    the motion actually took.  Dropping a key is different -- the segment it
+    joined is replaced by a straight line between its neighbours, so a limb
+    that curved through that key now cuts the corner.
+
+    The threshold is on the *angular* distance to the kept key, measured as
+    the quaternion geodesic angle, not on some component-wise difference that
+    would let a 180-degree flip pass as small.
+
+    It is applied to fitted keys rather than to source keys.  A key dropped
+    before fitting is a key the resampler then had to interpolate across,
+    which is the loss compounding rather than two independent savings.
+
+    The first and last keys are always kept: an animation that starts by
+    holding its first pose for a frame, or ends one key early, is a visible
+    stutter at the ends for a saving nobody asked for.
+    """
+    times = np.asarray(times_s, dtype=np.float64)
+    rots = np.asarray(rotations, dtype=np.float64).reshape(-1, 4)
+    trans = (None if translations is None
+             else np.asarray(translations, dtype=np.float64).reshape(-1, 3))
+    if times.size <= 2:
+        empty = KeyReduction(times.size, times.size, 0, 0.0)
+        return times, rots, trans, empty
+
+    # Comparing each key to the last KEPT one, rather than to the one before
+    # it, is what stops a slow drift being dropped key by key: every key is
+    # measured against something the animation will actually still show.
+    keep = np.zeros(times.size, dtype=bool)
+    keep[0] = True
+    keep[-1] = True
+    # (dropped index, kept index before it, kept index after it).  Filled
+    # during the pass, when both neighbours are known, rather than recovered
+    # afterwards by index arithmetic.
+    bracketed: list[tuple[int, int, int]] = []
+    last_kept = 0
+    for index in range(1, times.size - 1):
+        if mathx.quat_angle_deg(rots[last_kept], rots[index]) > threshold_deg:
+            keep[index] = True
+            last_kept = index
+        else:
+            bracketed.append((index, last_kept, -1))
+    # The kept key after each dropped one is the next one that survived.
+    for position, (index, before, _) in enumerate(bracketed):
+        after = last_kept
+        for later in range(index + 1, times.size):
+            if keep[later]:
+                after = later
+                break
+        bracketed[position] = (index, before, after)
+
+    new_times = times[keep]
+    new_rots = rots[keep]
+    new_trans = None if trans is None else trans[keep]
+
+    # The largest deviation this introduced, so the cost is a number in
+    # degrees rather than a key count.  Each dropped key is compared against
+    # the line the two keys now either side of it draw.
+    # What the reduction costs, in the only terms a viewer can observe: how
+    # far the pose now drawn at any instant sits from the pose that was
+    # there.
+    #
+    # Measured *between* the kept keys, not at them. At a kept key the value
+    # is the original one by construction, so sampling there reports zero for
+    # every reduction ever done and looks like a bug. The deviation lives in
+    # the chord, and the chord is what plays.
+    #
+    # Not the angle a dropped key makes with the line between its neighbours
+    # either. That angle is large by construction -- a dropped key is exactly
+    # the corner being cut -- so it measures how sharply the motion turns
+    # rather than how wrong the result looks. An earlier version reported it
+    # and claimed 17.7 degrees on a clip that plays back identically.
+    worst = 0.0
+    kept_indices = [index for index in range(times.size) if keep[index]]
+    # A quarter of each segment is enough to find the bulge of a chord: a
+    # slerp curve deviates from a straight blend monotonically from each end,
+    # so sampling the interior finds the same maximum a dense sweep would.
+    SUBDIVISIONS = 4
+    for position in range(len(kept_indices) - 1):
+        left = kept_indices[position]
+        right = kept_indices[position + 1]
+        span = times[right] - times[left]
+        if span <= 0:
+            continue
+        for step in range(1, SUBDIVISIONS):
+            blend = step / SUBDIVISIONS
+            moment = times[left] + span * blend
+            reduced_pose = mathx.quat_slerp(rots[left], rots[right], blend)
+            # What the original animation held at that instant.
+            upper = int(np.searchsorted(times, moment, side="right"))
+            upper = min(upper, times.size - 1)
+            lower = max(0, upper - 1)
+            gap = times[upper] - times[lower]
+            if gap <= 0:
+                original = rots[lower]
+            else:
+                original = mathx.quat_slerp(
+                    rots[lower], rots[upper],
+                    float((moment - times[lower]) / gap))
+            worst = max(worst, mathx.quat_angle_deg(original, reduced_pose))
+
+    reduction = KeyReduction(
+        source_keys=int(times.size),
+        kept_keys=int(new_times.size),
+        dropped_keys=int(times.size - new_times.size),
+        max_error_deg=float(worst),
+        threshold_deg=float(threshold_deg),
+    )
+    return new_times, new_rots, new_trans, reduction
+
+
+@dataclass
+class KeyReduction:
+    """What dropping negligible keys cost, in keys and in degrees."""
+
+    source_keys: int
+    kept_keys: int
+    dropped_keys: int
+    max_error_deg: float
+    threshold_deg: float = 0.0
+
+    @property
+    def fits_without_loss(self) -> bool:
+        return self.dropped_keys == 0
+
+    def describe(self) -> str:
+        if self.dropped_keys == 0:
+            return (f"no key moved by more than {self.threshold_deg:.2f} "
+                    f"degrees, so nothing was dropped")
+        cost = (f"the pose at any instant is within {self.max_error_deg:.3f} "
+                f"degrees of what it was"
+                if self.max_error_deg < 0.0005 else
+                f"the pose is now up to {self.max_error_deg:.3f} degrees "
+                f"away from what it was at the worst instant")
+        return (f"{self.dropped_keys} of {self.source_keys} keys moved the "
+                f"pose by less than {self.threshold_deg:.2f} degrees and were "
+                f"dropped; {cost}")
+
+    def to_dict(self) -> dict:
+        return {"source_keys": self.source_keys, "kept_keys": self.kept_keys,
+                "dropped_keys": self.dropped_keys,
+                "max_error_deg": round(self.max_error_deg, 6),
+                "threshold_deg": round(self.threshold_deg, 6),
+                "fits_without_loss": self.fits_without_loss}
+
+
 def _pack_name(name: str) -> bytes:
     """A 24-byte, null-padded, ASCII name.
 
@@ -337,6 +492,8 @@ class BoneFrames:
     is_root: bool = False
     #: What fitting the format's clock cost.  Populated by :meth:`fit`.
     fitting: "TimeFitting | None" = None
+    #: What opt-in key reduction cost.  Populated by :meth:`Animation.reduce`.
+    reduction: "KeyReduction | None" = None
     _fitted: bool = False
 
     def __post_init__(self) -> None:
@@ -374,6 +531,22 @@ class BoneFrames:
         if self.frame_count and self.times_s[-1] * TIME_UNITS_PER_SECOND > MAX_TIME_UNITS:
             return False
         return True
+
+    def reduce(self, threshold_deg: float = 0.25) -> "KeyReduction":
+        """Opt-in: drop this bone's keys that barely move. Lossy, so it is
+        never automatic.
+
+        Applied to fitted keys, not to source keys, so it does not compound
+        with the resampling: a key dropped here is one the resampler already
+        evaluated onto the clock correctly.
+        """
+        times, rots, trans, reduction = drop_negligible_keys(
+            self.times_s, self.rotations, self.translations, threshold_deg)
+        self.times_s, self.rotations = times, rots
+        self.translations = trans
+        self.reduction = reduction
+        self._fitted = False
+        return reduction
 
     def fit(self) -> "TimeFitting":
         """Fit this bone's keys to the format's clock, in place.
@@ -430,6 +603,29 @@ class BoneFrames:
 
 @dataclass
 class Animation:
+    """One animation: a set of bone tracks plus its header fields."""
+
+    def reduce(self, threshold_deg: float = 0.25) -> "KeyReduction":
+        """Opt-in: drop keys that barely move, and report what it cost.
+
+        Lossy, and never automatic.  The resampling in :meth:`fit` is not --
+        every key that survives it lands on the path the motion took -- so
+        this is the only stage that discards information, which is why it
+        stays behind a flag and states its error in degrees.
+        """
+        if not self.bones:
+            return KeyReduction(0, 0, 0, 0.0, threshold_deg)
+        source = kept = dropped = 0
+        worst = 0.0
+        for bone in self.bones:
+            bone.reduce(threshold_deg)
+            reduction = bone.reduction
+            source += reduction.source_keys
+            kept += reduction.kept_keys
+            dropped += reduction.dropped_keys
+            worst = max(worst, reduction.max_error_deg)
+        return KeyReduction(source, kept, dropped, worst, threshold_deg)
+
     """One named animation: a set of bones with their key data."""
 
     name: str
@@ -609,7 +805,9 @@ def write_ifp(
 __all__ = [
     "Animation",
     "BoneFrames",
+    "KeyReduction",
     "TimeFitting",
+    "drop_negligible_keys",
     "fit_keys_to_clock",
     "IfpWriteError",
     "build_ifp",

@@ -687,7 +687,8 @@ def convert(args: argparse.Namespace, console: Console) -> int:
         console.write("")
 
     # -- build and write --------------------------------------------------- #
-    built = build_animation(animation_name, retarget, skeleton, block_name)
+    built = build_animation(animation_name, retarget, skeleton, block_name,
+                            reduce_threshold_deg=args.reduce_keys)
     for warning in built.warnings:
         console.write(f"  {console.yellow('warn')} {warning}")
     if built.animation is None:
@@ -696,6 +697,9 @@ def convert(args: argparse.Namespace, console: Console) -> int:
         if args.as_json:
             console.always(json.dumps(result, indent=2))
         return EXIT_VALIDATION
+
+    if built.key_reduction is not None:
+        result["key_reduction"] = built.key_reduction.to_dict()
 
     try:
         written = write_ifp(args.out, [built.animation], block_name)
@@ -880,6 +884,11 @@ def build_parser() -> argparse.ArgumentParser:
                       help="remove root motion (default)")
     conv.add_argument("--root-motion", dest="in_place", action="store_false",
                       help="keep the source root motion")
+    conv.add_argument("--reduce-keys", type=float, default=None,
+                      metavar="DEG",
+                      help="drop keys that move the pose by less than DEG "
+                           "degrees (opt-in, lossy; the default keeps them "
+                           "all and only resamples onto the format's clock)")
 
     doctor = subparsers.add_parser("doctor", help="environment and pipeline status")
 
