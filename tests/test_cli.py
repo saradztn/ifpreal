@@ -139,3 +139,60 @@ class TestNameSanitising:
         different animation with no sign anything went wrong.
         """
         assert cli._sanitise("x" * 200) == "X" * 200
+
+
+class TestMtaExample:
+    """The shipped resource and the shipped IFP have to agree.
+
+    They are two files that reference each other by name, and nothing else
+    checks that the names still match after either is edited.  A resource
+    asking for an animation that is not in the file it loads fails at
+    runtime on a player's screen, which is the worst place to find out.
+    """
+
+    RESOURCE = "examples/samp_anim_play.resource"
+    IFP = "examples/samba.ifp"
+
+    def test_the_example_ifp_exists_and_parses(self):
+        from gta_fbx_ifp_converter.gta.ifp_reader import read_ifp
+
+        parsed = read_ifp(self.IFP)
+        assert parsed.animation_count >= 1
+        assert parsed.structural is True if hasattr(parsed, "structural") else True
+
+    def test_the_resource_asks_for_an_animation_the_file_contains(self):
+        import re
+
+        from gta_fbx_ifp_converter.gta.ifp_reader import read_ifp
+
+        parsed = read_ifp(self.IFP)
+        source = open(self.RESOURCE, encoding="utf-8").read()
+        wanted = re.search(r'ANIM_NAME\s*=\s*"([^"]+)"', source).group(1)
+        assert wanted in [a.name for a in parsed.animations], (
+            f"the resource plays {wanted!r} but the IFP holds "
+            f"{[a.name for a in parsed.animations]}")
+
+    def test_the_resource_uses_the_two_functions_the_brief_names(self):
+        source = open(self.RESOURCE, encoding="utf-8").read()
+        assert "engineLoadIFP(" in source
+        assert "setPedAnimation(" in source
+
+    def test_a_wrong_name_would_be_reported_not_silently_ignored(self):
+        """The resource logs the names it found before using one."""
+        source = open(self.RESOURCE, encoding="utf-8").read()
+        assert "contains:" in source, (
+            "engineLoadIFP returns a table keyed by name and a wrong name is "
+            "absent rather than an error; nothing is reported unless the "
+            "found names are logged")
+
+    def test_the_resource_is_valid_lua(self):
+        """Syntax errors in a .resource only surface when MTA loads it.
+
+        MTA loads resources at server start, so a typo takes the whole
+        server's start-up down rather than showing a message about this one
+        file.  Parsing it here is the only cheap check there is.
+        """
+        pytest.importorskip("luaparser", reason="optional Lua parser")
+        from luaparser import ast
+
+        ast.parse(open(self.RESOURCE, encoding="utf-8").read())

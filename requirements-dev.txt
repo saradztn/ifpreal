@@ -1,0 +1,9 @@
+-r requirements.txt
+
+# The window.  The converter and its command line do not need this; only
+# run_gui.py and tests/test_gui.py do.
+PySide6-Essentials>=6.6
+
+# Test-only, optional: parses the shipped .resource so a Lua syntax error is
+# caught here rather than when a server fails to start.
+luaparser>=3.1
