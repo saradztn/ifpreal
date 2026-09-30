@@ -55,6 +55,9 @@ DERIVED_ROLE = "role"
 DERIVED_AXIS = "axis"
 DERIVED_NONE = "none"
 
+#: The no-rotation quaternion, in the XYZW order an IFP stores.
+IDENTITY = np.array([0.0, 0.0, 0.0, 1.0])
+
 
 @dataclass(frozen=True)
 class BoneAxis:
@@ -189,6 +192,44 @@ def rotation_between(source: np.ndarray, target: np.ndarray) -> np.ndarray:
     return mathx.quat_normalize(mathx.quat_from_axis_angle(axis, np.arccos(dot)))
 
 
+def _correction_for(
+    rest_source: np.ndarray,
+    rest_target: np.ndarray,
+    source_axis: np.ndarray,
+    target_axis: np.ndarray,
+) -> np.ndarray:
+    """The frame change carrying this bone's motion from source to target.
+
+    Note what this is *not*: it is not the rotation ``A`` that satisfies
+    ``A * source_rest * A^-1 == target_rest``.  That equation has no solution
+    when the source rests at identity, because the left-hand side is then the
+    identity whatever ``A`` is -- and on the Mixamo rig every bone does rest
+    at identity, so the equation is unsatisfiable there.
+
+    What the retarget needs is narrower and always solvable: given a bone's
+    *turn since rest*, ``delta``, produce the target's local rotation as
+    ``target_rest * (A * delta * A^-1)``.  Any ``A`` gives the right answer
+    when ``delta`` is the identity, so ``A`` is free -- and the best use of
+    that freedom is to make it carry the two rigs' rest orientations into
+    each other, ``target_rest * source_rest^-1``, because that is the change
+    of frame the two rigs actually disagree about.
+
+    The measured bone axes are the tie-breaker for the case where even that
+    is unconstrained: both rigs resting at identity leaves the roll free, and
+    the bone's own direction is then the only evidence about which way it
+    ought to face.
+    """
+    source = mathx.quat_normalize(rest_source)
+    target = mathx.quat_normalize(rest_target)
+    if np.allclose(source, IDENTITY, atol=1e-9) and np.allclose(
+        target, IDENTITY, atol=1e-9
+    ):
+        return rotation_between(source_axis, target_axis)
+    return mathx.quat_normalize(
+        mathx.quat_multiply(target, mathx.quat_inverse(source))
+    )
+
+
 @dataclass
 class BoneCorrection:
     """The rest-pose correction for one mapped bone."""
@@ -207,9 +248,15 @@ class BoneCorrection:
 
     @property
     def total(self) -> np.ndarray:
-        return mathx.quat_normalize(
-            mathx.quat_multiply(self.reorient, self.rebased)
-        )
+        """The correction that carries the source rest pose onto the target's.
+
+        This is :attr:`reorient` alone.  The :attr:`rebased` term exists to
+        re-base a bone whose source and target parents are unrelated, and it
+        describes a *change of frame*, not a change of pose -- folding it in
+        here would break the one property everything else depends on, that a
+        zero delta reproduces the target's bind rotation exactly.
+        """
+        return self.reorient
 
     @property
     def is_identity(self) -> bool:
@@ -404,8 +451,11 @@ def build_rest_pose_correction(
         if not (0 <= s < len(source_axes) and 0 <= t < len(target_axes)):
             continue
 
-        reorient = rotation_between(
-            source_axes[s].direction, target_axes[t].direction
+        reorient = _correction_for(
+            rest_source=mathx.quat_normalize(source_quaternions[s]),
+            rest_target=mathx.quat_normalize(target_quaternions[t]),
+            source_axis=source_axes[s].direction,
+            target_axis=target_axes[t].direction,
         )
         correction = BoneCorrection(
             source_index=s,

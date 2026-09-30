@@ -263,15 +263,18 @@ def test_each_limb_is_corrected_for_its_own_rig_not_a_shared_average(pose):
            not np.allclose(lc.reorient, rc.reorient, atol=1e-3)
 
 
-def test_a_mirrored_source_on_a_symmetric_target_still_works(pose):
-    """Mirroring is not free, and the correction has to pay for it.
+def test_the_correction_depends_only_on_the_rigs_not_on_the_limb(pose):
+    """Two bones that rest the same way are corrected the same way.
 
-    This ped's two forearms have identical axes (they point the same way), but
-    the Mixamo rig's are exact mirrors.  So the left forearm needs a half turn
-    and the right needs none -- a 180 degree difference between two bones
-    that look identical in the target.  That is correct, not a bug, and it is
-    the reason a retarget cannot mirror one limb and copy the answer to the
-    other.
+    This ped's forearms have identical bind rotations and the Mixamo rig's
+    rest at identity, so the frame change is the same for both -- and it
+    *should* be.  The mirror in the source (left forearm points +X, right
+    points -X) lives in the animation, not in the rest pose, so it belongs
+    in the transferred delta rather than in the correction.
+
+    A correction that varied per limb would mean the rest pose was being
+    baked into the correction, which is precisely the bug that stands a
+    character up at the wrong angle when it stands still.
     """
     result, correction, _skeleton, _rig = pose
     by_role = {}
@@ -286,14 +289,13 @@ def test_a_mirrored_source_on_a_symmetric_target_still_works(pose):
     lc = correction.get(left.source_index)
     rc = correction.get(right.source_index)
 
-    # The target axes really are identical here.
+    # The two target bones really do rest identically.
     assert np.allclose(lc.target_axis.direction, rc.target_axis.direction, atol=1e-6)
-    # The source axes really are exact mirrors.
+    # The source's mirror is real, and lives in the axis measurement.
     assert np.allclose(lc.source_axis.direction, -rc.source_axis.direction, atol=1e-3)
-    # And so the corrections are 180 degrees apart -- which is the whole
-    # point, stated as a fact about these two files.
-    difference = mathx.quat_angle_deg(lc.reorient, rc.reorient)
-    assert difference == pytest.approx(180.0, abs=1.0)
+    # Yet the correction is shared, because the correction is a property of
+    # the rest orientations and both of those are the same.
+    assert mathx.quat_angle_deg(lc.reorient, rc.reorient) == pytest.approx(0.0, abs=1e-6)
 
 
 def test_correction_is_deterministic(pose):
@@ -321,3 +323,42 @@ def test_reorient_applied_to_nothing_is_the_identity(pose):
     """An unmapped bone's correction is identity, not an error and not a guess."""
     _result, correction, _skeleton, _rig = pose
     assert np.allclose(correction.reorient(9999), IDENTITY)
+
+
+def test_a_zero_turn_produces_the_target_bind_pose(pose):
+    """The property the retarget actually depends on.
+
+    A bone that has not turned since its rest pose must come out at the
+    target's own bind rotation.  Stated that way rather than as an equation
+    on the correction, because the equation ``A * S * A^-1 = T`` is only
+    solvable when ``S`` is not the identity -- and on this rig every source
+    rest rotation *is* the identity, so the equation is unsatisfiable here
+    while the property it was meant to guarantee holds exactly.
+
+    The distinction matters: solving for ``A`` as ``T * S^-1`` and
+    conjugating the delta is right for every bone, and a test written as an
+    equation would reject the correct answer.
+    """
+    result, correction, skeleton, rig = pose
+    for match in result.mapped:
+        bone_correction = correction.get(match.source_index)
+        if bone_correction is None:
+            continue
+        delta = mathx.quat_normalize(np.array([0.0, 0.0, 0.0, 1.0]))
+        turned = mathx.quat_normalize(mathx.quat_multiply(
+            bone_correction.reorient,
+            mathx.quat_multiply(delta, mathx.quat_inverse(bone_correction.reorient)),
+        ))
+        output = mathx.quat_normalize(mathx.quat_multiply(
+            turned, mathx.quat_normalize(
+                skeleton.bones[match.target_index].bind_local_quat
+            )
+        ))
+        target_rest = mathx.quat_normalize(
+            skeleton.bones[match.target_index].bind_local_quat
+        )
+        angle = mathx.quat_angle_deg(output, target_rest)
+        assert angle < 1e-6, (
+            f"{match.source_name!r}: a zero turn lands {angle:.6f} degrees "
+            f"off the target's bind pose"
+        )
