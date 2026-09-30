@@ -94,6 +94,12 @@ class BoneMatch:
     confidence: float = 0.0
     reason: str = ""
     user_edited: bool = False
+    #: The bone above this one in the source rig, or -1 for a root.  Kept on
+    #: the match because the retarget stage needs to know whether a bone's
+    #: source parent and target parent are themselves a matched pair, and that
+    #: question can only be answered here.
+    source_parent: int = -1
+    target_parent: int = -1
 
     @property
     def is_mapped(self) -> bool:
@@ -112,6 +118,8 @@ class BoneMatch:
             "confidence": round(self.confidence, 4),
             "reason": self.reason,
             "user_edited": self.user_edited,
+            "source_parent": self.source_parent,
+            "target_parent": self.target_parent,
         }
 
 
@@ -300,6 +308,8 @@ def map_rig(
             target_index=None,
             kind=MatchKind.UNMAPPED,
             confidence=0.0,
+            source_parent=bone.parent if bone.parent is not None else -1,
+            target_parent=-1,
         ))
 
     # -- pass 1b: disambiguate within each limb chain ---------------------- #
@@ -321,6 +331,9 @@ def map_rig(
         match.target_index = target_bone.index
         match.target_name = target_bone.name
         match.target_tag = target_bone.resolved_tag
+        match.target_parent = (
+            target_bone.parent if target_bone.parent is not None else -1
+        )
         match.kind = kind
         match.confidence = CONFIDENCE[kind]
         match.reason = reason
@@ -344,6 +357,9 @@ def map_rig(
             match.target_index = target_bone.index
             match.target_name = target_bone.name
             match.target_tag = target_bone.resolved_tag
+            match.target_parent = (
+                target_bone.parent if target_bone.parent is not None else -1
+            )
             match.kind = MatchKind.ALIAS
             match.confidence = CONFIDENCE[MatchKind.ALIAS]
             match.reason = f"role {match.role.value} + {match.side.value}"
