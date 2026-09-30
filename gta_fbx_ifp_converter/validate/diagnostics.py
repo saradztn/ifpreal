@@ -10,6 +10,7 @@ None of these announce themselves, and each has to be looked for by name.
 from __future__ import annotations
 
 import math
+import os
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Sequence
@@ -367,36 +368,149 @@ def check_upside_down(
     return report
 
 
-def check_reversed_joints(
-    parsed: ParsedIfp,
-    skeleton=None,
-    report: DiagnosticReport | None = None,
+def check_quaternions(
+    parsed: ParsedIfp, report: DiagnosticReport | None = None
 ) -> DiagnosticReport:
-    """A limb's children must stay on the correct side of it.
+    """Every stored quaternion must be a finite, unit-length rotation.
 
-    A knee whose shin ends up behind the thigh has a reversed joint.  It is
-    detectable from the file by accumulating world positions: a leg whose
-    foot is on the far side of its knee, or an arm whose hand crosses its
-    body, is bent the wrong way.  With no skeleton to compare against the
-    check is skipped rather than guessed at -- a wrong answer here would
-    reject a correct file.
+    A value that is not unit length is not a rotation, and the engine will
+    scale it however it likes -- which is how a file that passes every
+    structural check can still move a limb in a way nothing here predicted.
+    The length the file actually stores is checked, not the one it was given:
+    that is the number the game will use.
+
+    4096 is the scale, so the largest legal length is 4096 and the tolerance
+    is one quantisation step.  A component that overflows int16 shows up here
+    rather than as a limb bent somewhere impossible.
     """
     report = report if report is not None else DiagnosticReport()
+    from ..gta.ifp_writer import MAX_ROTATION_UNITS, ROTATION_SCALE
+
     for animation in parsed.animations:
         for obj in animation.objects:
             for frame in obj.frames:
-                rotation = frame.rotation
-                norm = float(np.linalg.norm(rotation))
-                if not np.isfinite(norm) or abs(norm - 1.0) > QUATERNION_NORM_TOLERANCE:
+                raw = np.asarray(frame.rotation_raw, dtype=np.float64)
+                length = float(np.linalg.norm(raw))
+                expected = ROTATION_SCALE
+                if (not np.isfinite(length)
+                        or abs(length - expected) > QUATERNION_NORM_TOLERANCE * expected
+                        or np.any(np.abs(raw) > MAX_ROTATION_UNITS)):
                     report.add(
                         Defect.INVALID_QUATERNION,
-                        f"bone {obj.name!r} has a key whose quaternion has "
-                        f"length {norm:.4f}, not 1",
+                        f"bone {obj.name!r} has a key whose quaternion is "
+                        f"not a unit rotation: stored {tuple(int(v) for v in raw)}"
+                        f", length {length / expected:.4f} of {expected}"
+                        f"{' and not finite' if not np.isfinite(length) else ''}",
                         where=f"{obj.name!r} @ {frame.time_s:.2f}s",
-                        measured=norm,
+                        measured=length / expected,
                         expected=1.0,
                     )
+                    # One report per bone. A bone with every key wrong is
+                    # one defect, not five hundred.
+                    break
     return report
+
+
+def check_reversed_joints(
+    parsed: ParsedIfp,
+    skeleton=None,
+    source=None,
+    report: DiagnosticReport | None = None,
+) -> DiagnosticReport:
+    """A joint must not be driven past a half turn from its rest pose.
+
+    A knee rotates about a fixed axis and cannot swing through the place it
+    came from; an elbow likewise.  A file that drives one of them the long
+    way round -- which is what a mirrored mapping or a wrong local axis
+    produces -- is visible as a rotation past 180 degrees from rest, and that
+    is detectable from the output file alone.
+
+    Two more ambitious versions of this check were written and thrown away,
+    and the reasons are worth keeping because they are the obvious things to
+    try:
+
+    * **Comparing the child's world position against its rest direction.**
+      Fires on every correct file. A knee bent 90 degrees legitimately swings
+      the foot across the rest direction, so the test rejects real animation.
+
+    * **Comparing the output's bend axis against the source's.**  The two
+      rigs use different conventions -- GTA is Z-up and folds knees the
+      opposite way from a Mixamo rig -- so a *correct* conversion leaves
+      them 42 to 80 degrees apart.  On the Samba clip the two elbows measure
+      68.8 and 80.0 degrees, and any threshold that catches a mirrored knee
+      also rejects that file.  Self-consistency is not evidence either: a
+      uniformly reversed animation agrees with itself perfectly.
+
+    So the check stays with what the file itself can support, and says
+    nothing rather than guessing.  A diagnostic that fires on correct files
+    is worse than one that admits it cannot tell.
+    """
+    report = report if report is not None else DiagnosticReport()
+    if skeleton is None:
+        return report
+
+    from ..core import mathx
+
+    names = {b.name: b for b in skeleton.bones if b.bone_id >= 0}
+    for name, kind in ((" R Calf", "knee"), (" L Calf", "knee"),
+                       (" R ForeArm", "elbow"), (" L ForeArm", "elbow")):
+        bone = names.get(name)
+        if bone is None:
+            continue
+        obj = _find_object(parsed, bone.bone_id)
+        if obj is None or not obj.frames:
+            continue
+        rest = np.asarray(bone.bind_local_quat, dtype=float)
+        rest /= max(float(np.linalg.norm(rest)), 1e-12)
+        conjugate = np.array([-rest[0], -rest[1], -rest[2], rest[3]])
+
+        worst = 0.0
+        worst_time = 0.0
+        for frame in obj.frames:
+            q = np.asarray(frame.rotation, dtype=float)
+            norm = float(np.linalg.norm(q))
+            if norm < 1e-9:
+                continue
+            q = q / norm
+            relative = mathx.quat_multiply(q, conjugate)
+            # How far the joint has swung away from the pose it rests in.
+            angle = 2.0 * math.degrees(
+                math.acos(min(1.0, abs(float(relative[3])))))
+            if angle > worst:
+                worst, worst_time = angle, frame.time_s
+
+        if worst > MAX_JOINT_SWING_DEG:
+            report.add(
+                Defect.REVERSED_JOINT,
+                f"the {kind} at {name!r} swings {worst:.0f} degrees from its "
+                f"rest pose, past the half turn. A {kind} folds one way and "
+                f"cannot come back through the place it started; travel past "
+                f"180 means the bone is driven about the wrong local axis, or "
+                f"its mapping is mirrored.",
+                where=f"{name!r} @ {worst_time:.2f}s",
+                measured=worst,
+                expected=0.0,
+            )
+    return report
+
+
+#: How far a knee or elbow may travel from its rest pose.
+#:
+#: A joint that folds the wrong way does not merely swing further; it swings
+#: *through* the rest pose and comes out the other side, so its total travel
+#: passes 180.  Correct motion cannot.  The Samba clip's elbow reaches 145.8
+#: degrees, which is a genuine and fairly extreme dance pose, so the limit
+#: sits at 170 -- above the Samba figure with room, and below the half turn
+#: that a reversal requires.
+MAX_JOINT_SWING_DEG = 170.0
+
+
+def _find_object(parsed: ParsedIfp, bone_id: int):
+    for animation in parsed.animations:
+        for obj in animation.objects:
+            if obj.bone_id == bone_id:
+                return obj
+    return None
 
 
 def check_axis_convention(
@@ -441,7 +555,7 @@ def check_hanim_ids(
                 report.add(
                     Defect.INVALID_HANIM_ID,
                     f"bone {obj.name!r} drives HAnim id {obj.bone_id}, which "
-                    f"{skeleton.name or 'this ped'} does not have",
+                    f"{os.path.basename(skeleton.source_path or 'this ped')} does not have",
                     where=obj.name,
                 )
     return report
@@ -508,6 +622,7 @@ def diagnose_all(
     if parsed is not None:
         check_anp3(parsed, report)
         check_upside_down(parsed, report)
+        check_quaternions(parsed, report)
         check_reversed_joints(parsed, skeleton, report)
         check_axis_convention(parsed, report)
         if skeleton is not None:
@@ -517,6 +632,7 @@ def diagnose_all(
 
 __all__ = [
     "Defect",
+    "check_quaternions",
     "Finding",
     "DiagnosticReport",
     "check_source",
