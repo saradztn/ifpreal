@@ -34,6 +34,9 @@ EXIT_INPUT = 3
 EXIT_NOT_IMPLEMENTED = 4
 EXIT_VALIDATION = 5
 
+#: IFP name fields are 24 bytes including the NUL terminator.
+IFP_NAME_MAX = 23
+
 
 # --------------------------------------------------------------------------- #
 # console
@@ -41,9 +44,11 @@ EXIT_VALIDATION = 5
 class Console:
     """Tiny console helper: colours on a tty, plain text when piped."""
 
-    def __init__(self, stream=None, quiet: bool = False, no_color: bool = False):
+    def __init__(self, stream=None, quiet: bool = False, no_color: bool = False,
+                 json_mode: bool = False):
         self.stream = stream or sys.stdout
         self.quiet = quiet
+        self.json = json_mode
         colour = (
             not no_color
             and not quiet
@@ -86,6 +91,14 @@ class Console:
 
     def always(self, text: str = "") -> None:
         print(text, file=self.stream)
+
+    def say(self, text: str = "") -> None:
+        """Narration that must never reach stdout in --json mode.
+
+        Progress and the human validation report are still wanted, but
+        stdout has to stay a single JSON document or nothing can parse it.
+        """
+        print(text, file=self.stream if not self.json else sys.stderr)
 
     def error(self, text: str) -> None:
         print(self.red("ERROR: ") + text, file=sys.stderr)
@@ -408,16 +421,19 @@ def inspect_dff(
 # --------------------------------------------------------------------------- #
 #: Pipeline stages, in order, with whether the code that implements them is in
 #: the tree yet.  ``convert`` refuses to run while any of these is False.
+#: The bake stage is marked True because the writer fits and merges keys on
+#: the format's own 1/50 s clock; there is no separate bake pass, and having
+#: one would mean a second place for the timing to go wrong.
 PIPELINE_STAGES: list[tuple[str, bool]] = [
     ("FBX parse + source rig", True),
     ("FBX animation curves + clips", True),
     ("Target DFF + HAnim resolution", True),
-    ("Bone mapping (semantic + geometry)", False),
-    ("Rest-pose / local-axis solver", False),
-    ("Retarget (limb direction preserving)", False),
-    ("Keyframe bake with absolute timestamps", False),
-    ("ANP3 IFP writer", False),
-    ("Round-trip validator + metrics", False),
+    ("Bone mapping (semantic + geometry)", True),
+    ("Rest-pose / local-axis solver", True),
+    ("Retarget (limb direction preserving)", True),
+    ("Keyframe bake with absolute timestamps", True),
+    ("ANP3 IFP writer", True),
+    ("Round-trip validator + metrics", True),
 ]
 
 
@@ -546,14 +562,217 @@ def check(
 # convert
 # --------------------------------------------------------------------------- #
 def convert(args: argparse.Namespace, console: Console) -> int:
-    """Run the conversion.  Refuses to emit a partial IFP."""
-    check(args.fbx, args.dff, as_json=True)
-    console.always("")
-    console.error(
-        "Convert is not implemented yet. No .ifp was written. "
-        "Run 'gtafbx check' to see exactly which stages are missing."
+    """Run the whole pipeline and write a validated IFP.
+
+    Every stage reports rather than assumes.  A mapping below the confidence
+    floor blocks the export, an unmapped required bone blocks it, and a file
+    that does not survive being read back is never written to disk.  The
+    validation report is printed in full -- max, mean and RMS per bone -- so
+    the user can see what the output actually is rather than being told it
+    succeeded.
+    """
+    from gta_fbx_ifp_converter.fbx import source_rig as sr
+    from gta_fbx_ifp_converter.fbx import FbxParseError
+    from gta_fbx_ifp_converter.gta import dff_reader as dr
+    from gta_fbx_ifp_converter.gta import DffHanimError
+    from gta_fbx_ifp_converter.mapping import map_rig, evaluate, require_exportable
+    from gta_fbx_ifp_converter.mapping import MappingBlocked
+    from gta_fbx_ifp_converter.retarget import build_rest_pose_correction, retarget_clip
+    from gta_fbx_ifp_converter.retarget.transfer import RetargetSettings, RootMode
+    from gta_fbx_ifp_converter.gta.ifp_build import build_animation
+    from gta_fbx_ifp_converter.gta.ifp_writer import write_ifp, IfpWriteError
+    from gta_fbx_ifp_converter.gta.ifp_reader import read_ifp
+    from gta_fbx_ifp_converter.validate import validate_round_trip, diagnose_all
+
+    result: dict[str, Any] = {"command": "convert", "ok": False}
+
+    # -- load ------------------------------------------------------------- #
+    try:
+        rig = sr.load_source_rig(args.fbx)
+    except (FbxParseError, OSError) as exc:
+        console.error(f"could not read the FBX: {exc}")
+        return EXIT_INPUT
+    try:
+        skeleton = dr.load_skeleton(args.dff)
+    except (DffHanimError, OSError) as exc:
+        console.error(f"could not read the target DFF: {exc}")
+        return EXIT_INPUT
+
+    if not rig.animated_clips:
+        console.error("No animated Armature found.")
+        return EXIT_INPUT
+
+    clip = None
+    if args.clip:
+        clip = rig.clip(args.clip)
+        if clip is None:
+            console.error(
+                f"no clip named {args.clip!r}; this file has: "
+                + ", ".join(c.name for c in rig.animated_clips)
+            )
+            return EXIT_INPUT
+    else:
+        clip = rig.animated_clips[0]
+
+    animation_name = args.block or _sanitise(clip.name) or "ANIM"
+    block_name = args.block or animation_name
+
+    if not args.quiet:
+        console.say(console.bold(f"{clip.name!r} -> {animation_name!r}"))
+        console.kv("source", f"{args.fbx} ({len(rig.animated_clips)} clip(s), "
+                             f"{len(rig.bones)} bones)")
+        console.kv("target", f"{args.dff} ({len(skeleton.bones)} bones, "
+                             f"{sum(1 for b in skeleton.bones if b.is_addressable)} addressable)")
+        console.kv("duration", f"{clip.duration:.2f}s, {clip.frame_count} keys")
+        console.write("")
+
+    # -- map -------------------------------------------------------------- #
+    mapping = map_rig(rig.bones, skeleton)
+    report = evaluate(mapping, skeleton)
+    result["mapping"] = report.result.to_dict()
+    result["mapping_warnings"] = list(report.warnings)
+    result["mapping_errors"] = list(report.errors)
+
+    if not args.quiet:
+        console.kv("mapped", f"{len(report.result.mapped)}/{len(report.result.matches)} "
+                             f"bones, quality {report.result.quality_score():.3f}")
+        for warning in report.warnings[:8]:
+            console.write(f"  {console.yellow('warn')} {warning}")
+        if len(report.warnings) > 8:
+            console.write(f"  ... and {len(report.warnings) - 8} more warnings")
+        console.write("")
+
+    try:
+        require_exportable(report)
+    except MappingBlocked as blocked:
+        # A mapping the tool is not confident about must not become a file
+        # the user loads into their game and wonders about.
+        console.error("Incomplete mapping. Nothing was written.")
+        for reason in blocked.reasons:
+            console.write(f"  {reason}")
+        result["error"] = "incomplete mapping"
+        if args.as_json:
+            console.always(json.dumps(result, indent=2))
+        return EXIT_VALIDATION
+
+    # -- rest pose and retarget -------------------------------------------- #
+    correction = build_rest_pose_correction(
+        rig.bones,
+        [b.parent for b in rig.bones],
+        [b.bind_local_translation for b in rig.bones],
+        [b.bind_local_quat for b in rig.bones],
+        skeleton.bones,
+        [b.parent for b in skeleton.bones],
+        [b.bind_local_translation for b in skeleton.bones],
+        [b.bind_local_quat for b in skeleton.bones],
+        mapping.mapped,
     )
-    return EXIT_NOT_IMPLEMENTED
+    root_mode = RootMode.IN_PLACE if args.in_place else RootMode.FULL
+    retarget = retarget_clip(
+        rig, clip, mapping, correction, skeleton.bones,
+        RetargetSettings(root_mode=root_mode),
+    )
+    result["retarget"] = retarget.to_dict()
+    if not args.quiet:
+        console.kv("unit scale", f"{correction.unit_scale:.6f} "
+                                  f"(measured from both rest poses)")
+        console.kv("measured axes", f"{correction.measured_fraction:.0%} of bones")
+        console.kv("root", f"{root_mode.value}, travel {retarget.root_travel_s:.3f} m")
+        if retarget.unrepresentable:
+            console.write(
+                f"  {console.yellow('warn')} {len(retarget.unrepresentable)} "
+                f"source bones have no IFP representation; "
+                f"see the report for the full list"
+            )
+        console.write("")
+
+    # -- build and write --------------------------------------------------- #
+    built = build_animation(animation_name, retarget, skeleton, block_name)
+    for warning in built.warnings:
+        console.write(f"  {console.yellow('warn')} {warning}")
+    if built.animation is None:
+        console.error("Nothing could be written. No .ifp was created.")
+        result["error"] = "nothing to write"
+        if args.as_json:
+            console.always(json.dumps(result, indent=2))
+        return EXIT_VALIDATION
+
+    try:
+        written = write_ifp(args.out, [built.animation], block_name)
+    except IfpWriteError as exc:
+        console.error(f"the IFP could not be written: {exc}")
+        console.error("No usable .ifp was produced.")
+        result["error"] = str(exc)
+        if args.as_json:
+            console.always(json.dumps(result, indent=2))
+        return EXIT_VALIDATION
+
+    # -- validate what is actually on disk --------------------------------- #
+    parsed = read_ifp(args.out)
+    validation = validate_round_trip(built.animation, parsed, animation_name)
+    diagnostics = diagnose_all(
+        rig=rig, skeleton=skeleton, mapping=mapping,
+        parsed=parsed, correction=correction,
+    )
+    result["file"] = written
+    result["validation"] = validation.to_dict()
+    result["diagnostics"] = diagnostics.to_dict()
+    result["ok"] = validation.passed and diagnostics.is_clean
+
+    if not args.quiet:
+        console.say("")
+        console.say(validation.describe())
+        console.say("")
+        for finding in diagnostics.findings[:8]:
+            tag = console.red("FAIL") if finding.fatal else console.yellow("warn")
+            console.write(f"  {tag} {finding.defect.value}: {finding.describe()}")
+        if len(diagnostics.findings) > 8:
+            console.write(f"  ... and {len(diagnostics.findings) - 8} more")
+        console.say("")
+
+    if args.as_json:
+        console.always(json.dumps(result, indent=2))
+        return EXIT_OK if result["ok"] else EXIT_VALIDATION
+
+    if validation.passed and diagnostics.is_clean:
+        console.always(console.green(
+            f"Wrote {args.out} -- {written['bytes']} bytes, "
+            f"{written['objects']} bones, {written['frames']} keys."
+        ))
+        console.write(
+            f"  Load it with:  ifp = engineLoadIFP(\"{args.out}\", "
+            f"\"{block_name}\")"
+        )
+        return EXIT_OK
+
+    # The file exists and may well be fine, but the tool is not going to say
+    # so.  Saying PASSED here would be the one claim nothing supports.
+    console.error(
+        f"FAILED VALIDATION -- {args.out} was written but did not validate."
+    )
+    console.error("It is not safe to ship. The numbers above are what is wrong.")
+    return EXIT_VALIDATION
+
+
+def _sanitise(name: str) -> str:
+    """A clip name turned into something the game will accept as a block.
+
+    IFP names are 24 bytes and the game's own are upper-case with underscores.
+    A Mixamo clip is called ``mixamo.com``; left alone that becomes a block
+    name with a dot in it, which is legal on disk and awkward to type into
+    ``setPedAnimation``.
+
+    A name that is still too long is left long on purpose.  The writer
+    refuses over-long names rather than truncating them, and it is better to
+    fail at the write with "name is 30 bytes" than to hand the user a file
+    whose block name quietly ends 23 characters in.
+    """
+    cleaned = "".join(
+        ch if ch.isalnum() or ch == "_" else "_" for ch in (name or "")
+    )
+    while "__" in cleaned:
+        cleaned = cleaned.replace("__", "_")
+    return cleaned.strip("_").upper() or "ANIM"
 
 
 # --------------------------------------------------------------------------- #
@@ -693,7 +912,12 @@ def _add_global_switches(sub: argparse.ArgumentParser) -> None:
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
-    console = Console(quiet=args.quiet, no_color=args.no_color)
+    console = Console(quiet=args.quiet, no_color=args.no_color,
+                      json_mode=args.as_json)
+    if args.as_json:
+        # stdout has to stay a single JSON document, so narration is routed
+        # to stderr by `say()` rather than suppressed entirely.
+        console.quiet = True
 
     if not args.command:
         parser.print_help()
@@ -714,12 +938,6 @@ def main(argv: Sequence[str] | None = None) -> int:
     }
 
     if args.command == "convert":
-        if args.as_json:
-            console.always(json.dumps(
-                {"command": "convert", "ready": False,
-                 "error": "conversion pipeline not implemented"},
-                indent=2,
-            ))
         return convert(args, console)
 
     try:

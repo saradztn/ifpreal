@@ -22,7 +22,13 @@ from typing import Sequence
 import numpy as np
 
 from ..retarget.transfer import BoneTrack, RetargetReport
-from .ifp_writer import Animation, BoneFrames, IfpWriteError, TimeFitting
+from .ifp_writer import (
+    TIME_UNITS_PER_SECOND,
+    Animation,
+    BoneFrames,
+    IfpWriteError,
+    TimeFitting,
+)
 
 #: The ped bones an IFP object may name.  Taken from the target DFF, never
 #: from a hard-coded list -- a skin with a bone this project has never heard
@@ -166,7 +172,8 @@ def build_animation(
             f"time keys had to be reduced: {fitting.describe()}. The "
             f"animation keeps its length and its motion; the keys it lost "
             f"were {1 - fitting.stored_keys / max(1, fitting.source_keys):.0%} "
-            f"of the source's, inside a {1 / 50:.0f} second slot"
+            f"of the source's, each merged into a slot of "
+            f"{1.0 / TIME_UNITS_PER_SECOND:.2f} s or finer"
         )
     return result
 
