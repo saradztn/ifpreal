@@ -25,6 +25,11 @@ from typing import Iterable, Sequence
 import numpy as np
 
 from .bones import SaBoneTag, bone_tag_from_name, cross_check_frame, describe_tag
+from .tag_resolve import TagDiagnostic, TagResolution, resolve_tags
+
+#: Every tag the FBX/IFP pipeline can address.  A DFF may legitimately carry
+#: extras (jaw variants, lids); those stay as plain ints rather than failing.
+_KNOWN_TAGS = frozenset(int(t) for t in SaBoneTag)
 
 __all__ = [
     "GtaBone",
@@ -62,7 +67,12 @@ class GtaBone:
     #: Index inside the DFF skin's bone array, when the model has a skin.
     skin_bone_index: int | None = None
     hanim_flags: int = 0
+    #: Tag taken from the DFF's own HAnim plugin -- the authority.
     canonical_tag: SaBoneTag | None = None
+    #: Tag guessed from the frame name, kept only for cross-checking.
+    name_derived_tag: SaBoneTag | None = None
+    #: True for the frame that carries the HAnim plugin (the skeleton root).
+    is_hanim_root: bool = False
     has_non_identity_bind_rotation: bool = False
 
     @property
@@ -75,9 +85,19 @@ class GtaBone:
 
     _depth: int = 0
 
+    #: Set by :func:`load_skeleton` from the tag resolution: the value that
+    #: actually goes into the IFP object's ``BoneID`` field.
+    resolved_tag: int | None = None
+
     @property
     def bone_id(self) -> int:
-        """Bone id to write into the IFP, or ``-1`` when the DFF has no HAnim."""
+        """Bone id to write into the IFP, or ``-1`` when the DFF has no HAnim.
+
+        This is the *resolved* tag.  The DFF's raw HAnim ``node_id`` stays on
+        :attr:`hanim_id` for diagnostics but is not what the engine is fed.
+        """
+        if self.resolved_tag is not None:
+            return int(self.resolved_tag)
         return int(self.hanim_id) if self.hanim_id is not None else -1
 
     @property
@@ -100,14 +120,21 @@ class GtaBone:
 
 
 def _frame_matrix(rotation: Sequence[float], position: Sequence[float]) -> np.ndarray:
-    """Build a RenderWare local matrix from the DFF's row-major 3x3 + position.
+    """Build a RenderWare local matrix from the DFF's 3x3 basis + position.
 
-    RenderWare stores the 3x3 basis in *row-major* order inside the DFF
-    (``frame.right/upt/at``), whereas the rest of this project uses the
-    column-vector convention, hence the transpose.
+    RenderWare serialises ``RwMatrix`` as five ``RwV3d`` values -- ``right``,
+    ``up``, ``at``, ``pos``, ``pad`` -- and ``RwMatrixTransformPoint`` computes
+    ``p' = right*p.x + up*p.y + at*p.z + pos``.  The first three vectors are
+    therefore the *rows* of the matrix that acts on column vectors, so the
+    nine floats reshape straight into the 3x3 block with no transpose.
+
+    Verified against ``testdata/male01.dff``: read as rows, the bind pose
+    puts the head at z = +0.684 and the toes at z = -1.032 (a 1.72 m ped,
+    Z up, +Y to the character's left); transposing instead mirrors the
+    skeleton and makes the head the lowest point.
     """
     m = np.eye(4, dtype=np.float64)
-    m[:3, :3] = np.asarray(rotation, dtype=np.float64).reshape(3, 3).T
+    m[:3, :3] = np.asarray(rotation, dtype=np.float64).reshape(3, 3)
     m[:3, 3] = np.asarray(position, dtype=np.float64).reshape(3)
     return m
 
@@ -126,6 +153,9 @@ class GtaSkeleton:
         self.source_path = source_path
         self.model_names = list(model_names)
         self.has_skin = has_skin
+        #: Filled in by :func:`load_skeleton` once the DFF's HAnim has been
+        #: reconciled; see :mod:`.tag_resolve`.
+        self.tag_resolution: TagResolution | None = None
         self._by_name: dict[str, GtaBone] = {}
         self._by_hanim_id: dict[int, GtaBone] = {}
         for bone in self.bones:
@@ -140,11 +170,11 @@ class GtaSkeleton:
         for bone in order:
             if bone.parent < 0:
                 bone.bind_world_gta = bone.bind_local_gta.copy()
-                bone.depth = 0
+                bone._depth = 0
             else:
                 parent = self.bones[bone.parent]
                 bone.bind_world_gta = parent.bind_world_gta @ bone.bind_local_gta
-                bone.depth = parent.depth + 1
+                bone._depth = parent.depth + 1
 
     def topological_order(self) -> list[GtaBone]:
         """Bones ordered so that every parent precedes its children."""
@@ -186,23 +216,26 @@ class GtaSkeleton:
     def find_tag(self, tag: SaBoneTag | int) -> GtaBone | None:
         """Find the frame that carries an HAnim tag in *this* DFF.
 
-        Prefers the HAnim plugin id, then the canonical name, so a custom
-        ped that renames a frame still resolves.
+        The tag resolution from :mod:`.tag_resolve` is authoritative: it is
+        the value that will be written into the IFP object's ``BoneID``.
+        The raw HAnim ``node_id`` map is only a last resort, because on the
+        shipped SA peds it points at the wrong frames entirely.
         """
-        if isinstance(tag, SaBoneTag):
-            bone = self.by_hanim_id(int(tag))
-            if bone is not None:
-                return bone
-        else:
-            bone = self.by_hanim_id(int(tag))
-            if bone is not None:
-                return bone
-        canonical = SaBoneTag(tag) if not isinstance(tag, SaBoneTag) else tag
-        for candidate in (canonical.dff_frame_name, canonical.ifp_name):
-            if candidate:
-                bone = self.by_name(candidate)
-                if bone is not None:
-                    return bone
+        value = int(tag)
+        if self.tag_resolution is not None:
+            frame = self.tag_resolution.frame_of_tag(value)
+            if frame is not None:
+                return self.bones[frame]
+        bone = self.by_hanim_id(value)
+        if bone is not None:
+            return bone
+        canonical = SaBoneTag(value) if value in _KNOWN_TAGS else None
+        if canonical is not None:
+            for candidate in (canonical.dff_frame_name, canonical.ifp_name):
+                if candidate:
+                    bone = self.by_name(candidate)
+                    if bone is not None:
+                        return bone
         return None
 
     @property
@@ -303,11 +336,18 @@ def load_skeleton(path: str, *, validate: bool = True) -> GtaSkeleton:
     if not dff.frames:
         raise DffHanimError(f"{path} contains no frames")
 
-    # The HAnim plugin lives on the *top* frame; rwfury attaches it there.
+    # The HAnim plugin rides on the skeleton's root frame.  It carries the
+    # authoritative tag for every animatable bone, and its ``node_index`` is
+    # the index into the clump's frame list.  Both relations were verified
+    # against testdata/male01.dff: skinning the mesh with
+    # ``inv(world[node_index])`` reproduces a 1.9 m Z-up ped, whereas an
+    # off-by-one frame mapping lays the model down along Y.
     root_hanim = None
-    for frame in dff.frames:
+    hanim_frame = -1
+    for index, frame in enumerate(dff.frames):
         if frame.hanim is not None and frame.hanim.bones:
             root_hanim = frame.hanim
+            hanim_frame = index
             break
 
     if root_hanim is None:
@@ -316,21 +356,25 @@ def load_skeleton(path: str, *, validate: bool = True) -> GtaSkeleton:
             f"({path}: {len(dff.frames)} frames, no HAnim plugin)"
         )
 
-    skin_bone_for_hanim: dict[int, int] = {}
+    # ``used_bone_indices[k]`` is the *HAnim bone array* index of the k-th
+    # skin bone, not a frame index.  For male01.dff this resolves to the 28
+    # body tags, correctly leaving Root/Belly/breasts unskinned.
+    skin_position_of_hanim: dict[int, int] = {}
     for geometry in dff.geometries:
         skin = getattr(geometry, "skin", None)
         if skin is None:
             continue
-        used = list(getattr(skin, "used_bone_indices", []) or [])
-        for hanim_bone in root_hanim.bones:
-            if hanim_bone.node_index < len(used):
-                skin_bone_for_hanim.setdefault(hanim_bone.node_id, used[hanim_bone.node_index])
+        for position, used in enumerate(getattr(skin, "used_bone_indices", []) or []):
+            skin_position_of_hanim.setdefault(int(used), position)
 
     from ..core.space import dff_to_gta  # local import: avoids a cycle
 
     hanim_by_frame: dict[int, tuple[int, int]] = {}
-    for hb in root_hanim.bones:
+    hanim_position_by_frame: dict[int, int] = {}
+    hanim_id_of_frame: dict[int, int | None] = {}
+    for position, hb in enumerate(root_hanim.bones):
         hanim_by_frame[hb.node_index] = (hb.node_id, hb.flags)
+        hanim_position_by_frame[hb.node_index] = position
 
     bones: list[GtaBone] = []
     for index, frame in enumerate(dff.frames):
@@ -338,7 +382,9 @@ def load_skeleton(path: str, *, validate: bool = True) -> GtaSkeleton:
         gta_matrix = dff_to_gta(matrix)
         translation, rotation, scale = _safe_decompose(gta_matrix)
         hanim_id, hanim_flags = hanim_by_frame.get(index, (None, 0))
-        tag = bone_tag_from_name(frame.name)
+        name_tag = bone_tag_from_name(frame.name)
+        hanim_id_of_frame[index] = None if hanim_id is None else int(hanim_id)
+        position_in_hanim = hanim_position_by_frame.get(index)
         bone = GtaBone(
             index=index,
             name=frame.name,
@@ -349,8 +395,13 @@ def load_skeleton(path: str, *, validate: bool = True) -> GtaSkeleton:
             bind_local_translation=translation,
             hanim_id=hanim_id,
             hanim_flags=hanim_flags,
-            skin_bone_index=skin_bone_for_hanim.get(hanim_id) if hanim_id is not None else None,
-            canonical_tag=tag,
+            skin_bone_index=(
+                skin_position_of_hanim.get(position_in_hanim)
+                if position_in_hanim is not None
+                else None
+            ),
+            name_derived_tag=name_tag,
+            is_hanim_root=(index == hanim_frame),
             has_non_identity_bind_rotation=bool(
                 np.max(np.abs(rotation - np.array([0.0, 0.0, 0.0, 1.0]))) > 1e-6
             ),
@@ -363,11 +414,54 @@ def load_skeleton(path: str, *, validate: bool = True) -> GtaSkeleton:
         bones,
         source_path=os.path.abspath(path),
         model_names=[n for n in model_names if n],
-        has_skin=bool(skin_bone_for_hanim),
+        has_skin=bool(skin_position_of_hanim),
     )
 
-    if validate and not skeleton.has_hanim:
-        raise DffHanimError("Target DFF has no valid ped HAnim skeleton")
+    # Decide which HAnim tag every frame really carries.  The DFF decides the
+    # tag *set* and the hierarchy; see :mod:`.tag_resolve` for why the
+    # ``node_id`` array cannot be trusted on its own.
+    resolution = resolve_tags(
+        [frame.name for frame in dff.frames],
+        {bone.index: bone.parent for bone in bones},
+        hanim_id_of_frame,
+        hanim_tags_available=sorted({b.node_id for b in root_hanim.bones}),
+    )
+    for bone in bones:
+        tag = resolution.tag_of_frame.get(bone.index)
+        if tag is None:
+            continue
+        bone.resolved_tag = int(tag)
+        bone.canonical_tag = SaBoneTag(tag) if tag in _KNOWN_TAGS else None
+    skeleton.tag_resolution = resolution
+
+    # The skin indexes the HAnim bone array, so it inherits the same stale
+    # enumeration as ``node_id`` does.  Report the damage rather than let it
+    # pass silently: the IFP never needs these indices, but a user reading
+    # the validation report should know the DFF disagrees with itself.
+    skinned_tags = {
+        bone.resolved_tag for bone in bones
+        if bone.skin_bone_index is not None and bone.resolved_tag is not None
+    }
+    if skinned_tags and not {1, 2, 3, 4, 5, 6, 7, 8, 21, 22, 23, 24, 25, 26,
+                             31, 32, 33, 34, 35, 36, 41, 42, 43, 44,
+                             51, 52, 53, 54} >= skinned_tags:
+        resolution.diagnostics.append(
+            TagDiagnostic(
+                "warning",
+                "skin-index-mismatch",
+                -1,
+                "the DFF skin references bones that do not form the ped body "
+                f"set under the resolved tags ({len(skinned_tags)} bones); the "
+                "DFF's skin and HAnim arrays use a different bone order than "
+                "its frame list",
+            )
+        )
+
+    if validate:
+        if not skeleton.has_hanim:
+            raise DffHanimError("Target DFF has no valid ped HAnim skeleton")
+        for problem in resolution.errors():
+            raise DffHanimError(f"Target DFF has no valid ped HAnim skeleton ({problem})")
     return skeleton
 
 

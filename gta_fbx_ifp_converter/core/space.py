@@ -36,6 +36,8 @@ __all__ = [
     "FBX_SYSTEM",
     "GTA_SYSTEM",
     "build_conversion",
+    "rotation_conversion",
+    "IDENTITY_CONVERSION",
     "dff_to_gta",
     "FBX_TO_GTA",
     "detect_fbx_system",
@@ -122,16 +124,6 @@ GTA_SYSTEM = CoordinateSystem(
     unit_scale=1.0,
 )
 
-#: Sanity check baked into the test-suite: X stays, Y(up) becomes Z(up),
-#: Z becomes -Y.  This is the familiar ``(x, y, z) -> (x, -z, y)`` map, but
-#: nothing in the code hard codes it -- it is derived from the two bases.
-FBX_TO_GTA = build_conversion(FBX_SYSTEM, GTA_SYSTEM)
-
-#: RenderWare frames in a DFF use GTA's own axes, so DFF -> pipeline space is
-#: the identity; it exists as a named function so call sites read honestly.
-IDENTITY_CONVERSION = mat_identity()
-
-
 def build_conversion(
     source: CoordinateSystem,
     target: CoordinateSystem,
@@ -140,11 +132,18 @@ def build_conversion(
 ) -> np.ndarray:
     """Return the matrix taking ``source`` coordinates into ``target``.
 
-    The linear part is ``B_target^-1 @ B_source``; the caller multiplies
-    homogeneous points on the left.  When both systems declare a unit scale
-    the ratio is applied to the translation column.
+    The linear part is ``B_target @ B_source^-1``: the columns are the images
+    of the source's (right, up, forward) axes expressed in target model
+    space, so ``C @ source.right == target.right`` and so on.  The caller
+    multiplies homogeneous points on the left.  When both systems declare a
+    unit scale the ratio is applied to the linear part.
+
+    The two bases are not both det=+1 -- a (right, up, forward) triple is
+    left handed by construction in a right handed world -- so this
+    conversion is legitimately a reflection when the handedness differs.
+    That is the correct relabelling, not an error.
     """
-    basis = np.linalg.inv(target.basis) @ source.basis
+    basis = target.basis @ np.linalg.inv(source.basis)
     matrix = mat_identity()
     scale = 1.0
     if apply_unit_scale:
@@ -158,13 +157,27 @@ def build_conversion(
 def rotation_conversion(source: CoordinateSystem, target: CoordinateSystem) -> np.ndarray:
     """Pure rotation part of a conversion (no unit scaling)."""
     matrix = mat_identity()
-    matrix[:3, :3] = np.linalg.inv(target.basis) @ source.basis
+    matrix[:3, :3] = target.basis @ np.linalg.inv(source.basis)
     return matrix
 
 
 def dff_to_gta(matrix: np.ndarray) -> np.ndarray:
     """DFF frame matrix -> pipeline GTA space (identity, unit scale)."""
     return np.array(matrix, dtype=np.float64)
+
+
+#: ``UnitScaleFactor`` values the FBX SDK actually writes, in cm per unit.
+FBX_UNIT_SCALES = (0.01, 0.1, 1.0, 10.0, 100.0, 1000.0, 10000.0, 100000.0)
+
+
+def _is_known_fbx_unit_scale(value) -> bool:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return False
+    if number <= 0.0:
+        return False
+    return any(abs(number - known) <= 1e-9 * max(1.0, known) for known in FBX_UNIT_SCALES)
 
 
 @dataclass
@@ -226,12 +239,13 @@ def detect_fbx_system(
                 f"{detected_up}-up; using the detected value"
             )
     if declared_unit_scale:
-        # FBX UnitScaleFactor: 1 = cm, 100 = m, 10 = dm, ...
+        # FBX ``UnitScaleFactor`` is centimetres per unit: 1 = cm (the FBX
+        # default), 10 = dm, 100 = m, 1000 = km, 0.1 = mm.
         report.unit_in_metres = float(declared_unit_scale) / 100.0
         report.scale_to_metres = report.unit_in_metres
-        if not (0.5 < report.unit_in_metres < 100.0):
+        if not _is_known_fbx_unit_scale(declared_unit_scale):
             report.warnings.append(
-                f"implausible FBX unit scale factor {declared_unit_scale}; "
+                f"unusual FBX unit scale factor {declared_unit_scale}; "
                 f"falling back to centimetres"
             )
             report.unit_in_metres = 0.01
@@ -248,3 +262,13 @@ def detect_fbx_system(
         conversion[:3, :3] *= report.scale_to_metres
         report.conversion = conversion
     return report
+
+
+#: Sanity check baked into the test-suite: X stays, Y(up) becomes Z(up),
+#: Z becomes -Y.  This is the familiar ``(x, y, z) -> (x, -z, y)`` map, but
+#: nothing in the code hard codes it -- it is derived from the two bases.
+FBX_TO_GTA = build_conversion(FBX_SYSTEM, GTA_SYSTEM)
+
+#: RenderWare frames in a DFF use GTA's own axes, so DFF -> pipeline space is
+#: the identity; it exists as a named function so call sites read honestly.
+IDENTITY_CONVERSION = mat_identity()
