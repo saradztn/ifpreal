@@ -1,0 +1,1 @@
+LIBDBUS_1_3 { global: *; };

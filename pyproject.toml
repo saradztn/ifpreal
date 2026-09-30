@@ -1,0 +1,3 @@
+
+[tool.pytest.ini_options]
+markers = ["slow: exercises the full pipeline on a real FBX and DFF"]
