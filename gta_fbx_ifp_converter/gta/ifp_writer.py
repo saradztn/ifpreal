@@ -164,18 +164,29 @@ def fit_keys_to_clock(
     rotations: np.ndarray,
     translations: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray | None, TimeFitting]:
-    """Resample keys onto the 1/50 s clock, keeping the motion faithful.
+    """Resample the motion onto the 1/50 s clock, one key per slot.
 
-    A key that would land in an occupied slot is *merged* into the one before
-    it rather than pushed later.  Pushing is worse than dropping here: a
-    dropped key costs one frame of positional error, while a pushed key
-    permanently shifts every subsequent key and stretches the whole animation.
-    The survivor is the later of the two, because the later key is where the
-    motion is heading and the gap to the next one is then correct.
+    The format has one 16-bit time per key, in 1/50 s units, so a 60 fps
+    source offers more keys than there are slots.  Something has to give, and
+    the question is only what.
 
-    The interpolation between surviving keys is linear in quaternion space,
-    which is the same thing the game does when it plays the file, so what is
-    measured here is what the player will see.
+    The keys kept are the *slots*, not the source keys.  Every occupied slot
+    gets exactly one output key, and that key is the source animation
+    evaluated at the time of the slot -- rotated by the source's own motion
+    between its two neighbouring keys, not copied from whichever source key
+    happened to be nearest.
+
+    That distinction is the whole point.  Keeping the source key that claims
+    each slot would throw away the motion *between* it and the next one, so a
+    fast limb crossing a slot boundary is drawn as the straight line between
+    its endpoints, and the animation visibly cuts the corner.  Evaluating the
+    source at the slot instead means the stored keys lie on the path the
+    motion actually took, and the error measured afterwards is the error the
+    player will see.
+
+    Interpolation is spherical in quaternion space, which is what the game
+    does when it plays the file, so this measures the same thing the player
+    will, rather than a linear blend the engine never performs.
     """
     times = np.asarray(times_s, dtype=np.float64)
     rots = np.asarray(rotations, dtype=np.float64).reshape(-1, 4)
@@ -186,30 +197,69 @@ def fit_keys_to_clock(
     if times.size == 0:
         empty = TimeFitting(0, 0, 0.0, 0.0)
         return times, rots, trans, empty
+    if times.size == 1:
+        # A single key has no motion to resample; give it the first slot so
+        # it is still stored rather than lost to an empty schedule.
+        slot = int(max(0.0, round(float(times[0]) * TIME_UNITS_PER_SECOND)))
+        return (np.array([slot / TIME_UNITS_PER_SECOND]), rots.copy(),
+                None if trans is None else trans.copy(),
+                TimeFitting(1, 1, 0.0, 0.0))
 
     slots = np.maximum(0, np.round(times * TIME_UNITS_PER_SECOND).astype(np.int64))
-    # Keep the last key that claims each slot.
-    keep = np.zeros(slots.size, dtype=bool)
-    last_for_slot: dict[int, int] = {}
-    for index, slot in enumerate(slots):
-        last_for_slot[int(slot)] = index
-    for index in range(slots.size):
-        keep[index] = last_for_slot[int(slots[index])] == index
 
-    new_times = slots[keep] / TIME_UNITS_PER_SECOND
-    new_rots = rots[keep]
-    new_trans = None if trans is None else trans[keep]
-    collided = int(times.size - int(keep.sum()))
+    # One output key per distinct slot, in time order.  The first and last
+    # source keys always have a slot of their own, so the animation keeps
+    # both ends and does not silently start or stop early.
+    unique_slots = np.unique(slots)
+    slot_times = unique_slots / TIME_UNITS_PER_SECOND
+
+    # Evaluate the source at each stored time rather than picking the source
+    # key nearest to it.  See the docstring: this is what keeps a fast limb
+    # from cutting the corner between two stored keys.
+    new_rots = np.empty((unique_slots.size, 4), dtype=np.float64)
+    for index, seconds in enumerate(slot_times):
+        new_rots[index] = _evaluate_rotation(times, rots, seconds)
+    if trans is None:
+        new_trans = None
+    else:
+        new_trans = np.empty((unique_slots.size, 3), dtype=np.float64)
+        for index, seconds in enumerate(slot_times):
+            new_trans[index] = [
+                np.interp(seconds, times, trans[:, axis]) for axis in range(3)
+            ]
+
+    collided = int(times.size - int(unique_slots.size))
     fitting = TimeFitting(
         source_keys=int(times.size),
-        stored_keys=int(keep.sum()),
+        stored_keys=int(unique_slots.size),
         source_duration_s=float(times[-1] - times[0]),
-        stored_duration_s=float(
-            new_times[-1] - new_times[0]
-        ) if new_times.size else 0.0,
+        stored_duration_s=float(slot_times[-1] - slot_times[0])
+        if slot_times.size else 0.0,
         collided_keys=collided,
     )
-    return new_times, new_rots, new_trans, fitting
+    return slot_times, new_rots, new_trans, fitting
+
+
+def _evaluate_rotation(
+    times: np.ndarray, rotations: np.ndarray, seconds: float
+) -> np.ndarray:
+    """The source's rotation at `seconds`, slerped between its own keys.
+
+    Outside the source's range the first or last key is held, because a
+    held pose is what the game does at the ends anyway; extrapolating a
+    quaternion past its last key can produce a rotation nobody performed.
+    """
+    if seconds <= times[0]:
+        return rotations[0].astype(np.float64)
+    if seconds >= times[-1]:
+        return rotations[-1].astype(np.float64)
+    upper = int(np.searchsorted(times, seconds, side="left"))
+    lower = upper - 1
+    span = times[upper] - times[lower]
+    if span <= 0.0:
+        return rotations[upper].astype(np.float64)
+    blend = (seconds - times[lower]) / span
+    return mathx.quat_slerp(rotations[lower], rotations[upper], float(blend))
 
 
 def _pack_name(name: str) -> bytes:

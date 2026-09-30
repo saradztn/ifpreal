@@ -34,8 +34,18 @@ Source-to-output fidelity is reported separately, on the same page:
   that is 42 of 69 bones: Mixamo fingers have nothing to map to, and the
   mapper says so by name rather than dropping them silently.
 - `time` — IFP stores time in 1/50 s steps. A 60 fps source cannot keep every
-  key whatever this tool does, so keys that share a slot are merged and the
-  export says how many. The Samba clip's 1149 keys per track become 557.
+  key whatever this tool does. The motion is **resampled** onto those slots
+  rather than decimated: every stored key is the source animation evaluated at
+  that time, slerped between its own keys, so the keys lie on the path the
+  motion took. The Samba clip's 1149 keys per track become 557, and the
+  export says so.
+
+  The difference is not small. On a limb rotating at 720°/s, keeping whichever
+  source key claimed each slot is up to **14.4°** off the true motion, because
+  the motion between that key and the next one is thrown away and drawn as a
+  straight line. Resampling is exact on the same fixture. The two approaches
+  produce the same number of keys and the same file size; only one of them is
+  the animation.
 
 Neither is hidden, and neither is called an accuracy figure.
 
@@ -164,8 +174,12 @@ Real bugs, each with the test that catches it:
 
 ```
 $ pytest -q
-159 passed
+164 passed
 ```
+
+The resampling one is worth singling out: on a fast rotation the previous
+keep-the-claiming-key behaviour was measurably wrong by 14°, it produced
+byte-identical file sizes, and nothing about the file said so.
 
 ## Known limits
 
@@ -199,7 +213,7 @@ gui/                       the window
     jobs.py                background threads
     preview.py             the side-by-side view
 examples/                  the MTA resource and a generated IFP
-tests/                     159 tests
+tests/                     164 tests
 testdata/                  a real FBX and a real DFF
 docs/                      format notes
 ```

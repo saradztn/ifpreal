@@ -528,3 +528,127 @@ def test_the_file_is_not_written_when_the_round_trip_fails(tmp_path, monkeypatch
             BoneFrames("Root", 0, rots, times, trans, is_root=True)
         ])], "x")
     assert not path.exists()
+
+
+class TestResamplingOntoTheClock:
+    """Keys are fitted to the 1/50 s clock by resampling, not by keeping
+    whichever source key claimed each slot.
+
+    Keeping the claiming key throws away the motion *between* it and the next
+    stored key, so a fast limb draws as a straight line between endpoints and
+    cuts the corner. Evaluating the source at the stored time keeps the keys
+    on the path the motion actually took. On a 720 deg/s rotation that is
+    the difference between 14 degrees of error and none.
+    """
+
+    @staticmethod
+    def _spinning_limb(rate_hz=4.0, seconds=2.0, fps=60.0):
+        from gta_fbx_ifp_converter.core import mathx
+
+        times = np.arange(0.0, seconds, 1.0 / fps)
+        rots = np.array([
+            mathx.quat_from_axis_angle([0, 0, 1], 2 * np.pi * rate_hz * t)
+            for t in times
+        ])
+        return times, rots
+
+    @staticmethod
+    def _source_at(times, rots, seconds):
+        from gta_fbx_ifp_converter.core import mathx
+
+        if seconds <= times[0]:
+            return rots[0]
+        if seconds >= times[-1]:
+            return rots[-1]
+        upper = int(np.searchsorted(times, seconds, side="left"))
+        lower = upper - 1
+        span = times[upper] - times[lower]
+        if span <= 0:
+            return rots[upper]
+        return mathx.quat_slerp(rots[lower], rots[upper],
+                                (seconds - times[lower]) / span)
+
+    def test_stored_keys_lie_on_the_motion_rather_than_near_it(self):
+        from gta_fbx_ifp_converter.gta.ifp_writer import fit_keys_to_clock
+
+        times, rots = self._spinning_limb()
+        stored_t, stored_r, _, fitting = fit_keys_to_clock(times, rots)
+        assert fitting.collided_keys > 0, "this fixture must actually collide"
+
+        errors = [mathx.quat_angle_deg(
+            self._source_at(stored_t, stored_r, s),
+            self._source_at(times, rots, s)) for s in stored_t]
+        assert max(errors) < 0.01, (
+            f"a resampled key is up to {max(errors):.4f} degrees off the "
+            f"source's path, so the animation cuts corners")
+
+    def test_keeping_the_claiming_key_would_have_been_much_worse(self):
+        """The old behaviour, kept as a comparison rather than a guess."""
+        from gta_fbx_ifp_converter.gta.ifp_writer import (
+            TIME_UNITS_PER_SECOND,
+            fit_keys_to_clock,
+        )
+        from gta_fbx_ifp_converter.core import mathx
+
+        times, rots = self._spinning_limb()
+        stored_t, stored_r, _, _ = fit_keys_to_clock(times, rots)
+
+        slots = np.maximum(0, np.round(times * TIME_UNITS_PER_SECOND).astype(int))
+        last_for_slot: dict[int, int] = {}
+        for index, slot in enumerate(slots):
+            last_for_slot[int(slot)] = index
+        naive_t = np.array(sorted(last_for_slot)) / TIME_UNITS_PER_SECOND
+        naive_r = np.array([rots[last_for_slot[int(round(t * TIME_UNITS_PER_SECOND))]]
+                            for t in naive_t])
+
+        good = max(mathx.quat_angle_deg(self._source_at(stored_t, stored_r, s),
+                                       self._source_at(times, rots, s))
+                   for s in stored_t)
+        naive = max(mathx.quat_angle_deg(self._source_at(naive_t, naive_r, s),
+                                         self._source_at(times, rots, s))
+                    for s in naive_t)
+        assert naive > 5.0, "the comparison should show a real error"
+        assert good < naive / 100, (
+            f"resampling gained almost nothing: {good:.4f} vs {naive:.4f}")
+
+    def test_the_length_and_the_ends_are_preserved(self):
+        from gta_fbx_ifp_converter.gta.ifp_writer import fit_keys_to_clock
+
+        times, rots = self._spinning_limb()
+        stored_t, stored_r, _, fitting = fit_keys_to_clock(times, rots)
+        assert abs(fitting.stored_duration_s - fitting.source_duration_s) < 0.021
+        assert fitting.stretch_ratio == pytest.approx(1.0, abs=0.002)
+        assert stored_t[0] == pytest.approx(times[0], abs=0.021)
+        assert stored_t[-1] == pytest.approx(times[-1], abs=0.021)
+
+    def test_translations_are_resampled_too(self):
+        from gta_fbx_ifp_converter.gta.ifp_writer import fit_keys_to_clock
+
+        times, rots = self._spinning_limb()
+        # A root that moves smoothly across the slot boundaries.
+        trans = np.stack([times, times * 2.0, np.zeros_like(times)], axis=1)
+        stored_t, _, stored_trans, _ = fit_keys_to_clock(times, rots, trans)
+        assert stored_trans is not None
+        assert stored_trans.shape == (len(stored_t), 3)
+        # It must stay on the source's line, not jump to a source key's value.
+        assert np.allclose(stored_trans[:, 1], stored_t * 2.0, atol=1e-9)
+
+    def test_a_source_that_already_fits_is_left_alone(self):
+        """Keys already on the clock must come through untouched.
+
+        Round-tripping them through a resample would be a no-op in value but
+        would still claim the clock cost something, and the report would stop
+        being able to say which animations were actually affected.
+        """
+        from gta_fbx_ifp_converter.gta.ifp_writer import (
+            TIME_UNITS_PER_SECOND,
+            fit_keys_to_clock,
+        )
+
+        times = np.arange(0.0, 2.0, 1.0 / TIME_UNITS_PER_SECOND)
+        rots = np.tile(np.array([0.0, 0.0, 0.0, 1.0]), (len(times), 1))
+        stored_t, stored_r, _, fitting = fit_keys_to_clock(times, rots)
+        assert fitting.collided_keys == 0
+        assert fitting.fits_without_loss
+        assert stored_t.size == times.size
+        assert np.allclose(stored_r, rots)
