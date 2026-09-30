@@ -126,7 +126,11 @@ def _file_info(path: str) -> dict[str, Any]:
     info["size"] = stat.st_size
     info["size_label"] = _bytes_label(stat.st_size)
     with open(path, "rb") as handle:
-        info["magic"] = handle.read(24)
+        magic = handle.read(24)
+    # Decoded, not raw bytes: this dict goes straight into the --json report
+    # and `json.dump` cannot serialise a bytes object.
+    info["magic"] = magic.decode("latin-1")
+    info["format"] = "binary" if magic.startswith(b"Kaydara FBX Binary") else "ascii"
     return info
 
 
@@ -424,27 +428,54 @@ def check(
     console: "Console | None" = None,
 ) -> dict[str, Any]:
     """Load both sides and report whether a conversion can be trusted."""
-    source = inspect_fbx(fbx_path, bone_limit=1, as_json=True)
-    target = inspect_dff(dff_path, bone_limit=1, as_json=True)
+    # Bone lists are needed in full here: the checks below count resolved
+    # frames and unresolved ones, so truncating them would understate both.
+    source = inspect_fbx(fbx_path, bone_limit=0, as_json=True)
+    target = inspect_dff(dff_path, bone_limit=0, as_json=True)
 
-    blockers: list[str] = []
-    if not source["armatures"]:
-        blockers.append("ERROR: No animated Armature found.")
-    if not source["clips"]:
-        blockers.append("ERROR: No animated Armature found.")
+    problems: list[dict[str, str]] = []
+    if not source["armatures"] or not source["clips"]:
+        problems.append({
+            "code": "NO_ARMATURE",
+            "severity": "error",
+            "message": "No animated Armature found.",
+        })
     if not target["has_hanim"]:
-        blockers.append("ERROR: Target DFF has no valid ped HAnim skeleton.")
+        problems.append({
+            "code": "NO_HANIM",
+            "severity": "error",
+            "message": "Target DFF has no valid ped HAnim skeleton.",
+        })
     if source["resync_count"]:
-        blockers.append(
-            f"ERROR: the FBX had to resynchronise {source['resync_count']} time(s); "
-            "records were skipped and the animation may be incomplete."
-        )
+        problems.append({
+            "code": "FBX_RESYNC",
+            "severity": "error",
+            "message": (
+                f"the FBX had to resynchronise {source['resync_count']} "
+                "time(s); records were skipped and the animation may be incomplete."
+            ),
+        })
+    addressable = [b for b in target["bones"] if b["bone_id"] >= 0]
+    if target["bones"] and len(addressable) < len(target["bones"]):
+        problems.append({
+            "code": "UNRESOLVED_BONES",
+            "severity": "warning",
+            "message": (
+                f"{len(target['bones']) - len(addressable)} of "
+                f"{len(target['bones'])} target frames have no valid HAnim id "
+                "and cannot be written to an IFP."
+            ),
+        })
     missing = [name for name, done in PIPELINE_STAGES if not done]
     if missing:
-        blockers.append(
-            "ERROR: the conversion pipeline is incomplete; these stages are not "
-            "implemented yet: " + ", ".join(missing)
-        )
+        problems.append({
+            "code": "PIPELINE_INCOMPLETE",
+            "severity": "error",
+            "message": (
+                "the conversion pipeline is incomplete; these stages are not "
+                "implemented yet: " + ", ".join(missing)
+            ),
+        })
 
     report = {
         "source": source,
@@ -452,22 +483,58 @@ def check(
         "stages": [
             {"name": name, "implemented": done} for name, done in PIPELINE_STAGES
         ],
-        "blockers": blockers,
-        "ready": not blockers,
+        "blockers": [p["message"] for p in problems],
+        "problems": problems,
+        "ready": not problems,
     }
     if as_json:
         return report
 
     console = console or Console()
+    # What the two files actually are, before any verdict.
+    console.heading("Source FBX")
+    console.write(f"  file        {source['file']['path']}")
+    console.write(f"  format      {source['file']['format']} FBX {source['fbx_version']}")
+    console.write(
+        f"  rigs        {len(source['armatures'])} armature(s), "
+        f"{source['bone_count']} nodes"
+    )
+    for clip in source["clips"]:
+        console.write(
+            f"  clip        {clip['name']!r}: {clip['frames']} keys, "
+            f"{clip['duration_s']:.3f}s @ {clip['fps']:g} fps, "
+            f"{clip['animated_bones']} bones"
+        )
+
+    console.heading("Target DFF")
+    console.write(f"  file        {target['file']['path']}")
+    console.write(
+        f"  frames      {target['frame_count']} "
+        f"({len(addressable)} with a resolved HAnim id)"
+    )
+    console.write(
+        f"  HAnim       {'present' if target['has_hanim'] else 'MISSING'}"
+    )
+    for note in target["diagnostics"][:3]:
+        console.write(f"  note        {note['code']}: {note['message']}")
+    if len(target["diagnostics"]) > 3:
+        console.write(
+            f"              ... and {len(target['diagnostics']) - 3} more "
+            "(use inspect-dff)"
+        )
+
     console.heading("Pipeline")
     for name, done in PIPELINE_STAGES:
         mark = console.green("[x]") if done else console.red("[ ]")
         console.write(f"  {mark} {name}")
 
     console.heading("Result")
-    if blockers:
-        for blocker in blockers:
-            console.error(blocker)
+    if problems:
+        for problem in problems:
+            if problem.get("severity") == "warning":
+                console.warn(problem["message"])
+            else:
+                console.error(problem["message"])
         console.always("")
         console.always(console.bold("FAILED VALIDATION"))
         return report
@@ -595,8 +662,32 @@ def build_parser() -> argparse.ArgumentParser:
     conv.add_argument("--root-motion", dest="in_place", action="store_false",
                       help="keep the source root motion")
 
-    subparsers.add_parser("doctor", help="environment and pipeline status")
+    doctor = subparsers.add_parser("doctor", help="environment and pipeline status")
+
+    # Accept the global switches on either side of the subcommand.  argparse
+    # attaches them to the top-level parser only, so `gtafbx doctor --json` --
+    # the way anyone actually types it -- would otherwise fail.
+    for sub in (fbx, dff, both, conv, doctor):
+        _add_global_switches(sub)
     return parser
+
+
+_GLOBAL_SWITCHES = (
+    ("--quiet", dict(action="store_true", help="suppress reports")),
+    ("--no-color", dict(action="store_true", help="plain output")),
+    ("--json", dict(action="store_true", dest="as_json",
+                    help="machine readable output on stdout")),
+)
+
+
+def _add_global_switches(sub: argparse.ArgumentParser) -> None:
+    for name, options in _GLOBAL_SWITCHES:
+        if any(name in action.option_strings for action in sub._actions):
+            continue
+        # SUPPRESS, not False: a subparser default would overwrite whatever
+        # the top-level parser already decided, so `gtafbx --json doctor`
+        # would be undone by the subparser's own default.
+        sub.add_argument(name, default=argparse.SUPPRESS, **options)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -641,6 +732,19 @@ def main(argv: Sequence[str] | None = None) -> int:
         else:
             console.error(str(exc))
         return EXIT_INPUT
+    except OSError as exc:
+        # A missing or unreadable path.  Raised deep inside the readers, so it
+        # is translated here rather than at every call site.
+        message = f"{getattr(exc, 'filename', '') or ''}: {exc.strerror or exc}".strip(": ")
+        return _fail(args, console, message or str(exc), EXIT_INPUT)
+    except (ValueError, IndexError, KeyError, TypeError) as exc:
+        # rwfury and the FBX parser signal a malformed file with plain
+        # exceptions.  A user who points the tool at the wrong file should get
+        # one clear line, not a traceback through the dependency.
+        return _fail(
+            args, console, f"{args.command}: cannot read the input ({exc})",
+            EXIT_INPUT,
+        )
     except KeyboardInterrupt:                        # pragma: no cover
         console.error("interrupted")
         return 130
@@ -651,6 +755,22 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.command == "check" and not report.get("ready", True):
         return EXIT_VALIDATION
     return EXIT_OK
+
+
+def _fail(
+    args: argparse.Namespace,
+    console: Console,
+    message: str,
+    code: int,
+) -> int:
+    """Report a failure in whichever form the caller asked for."""
+    if getattr(args, "as_json", False):
+        console.always(json.dumps(
+            {"command": getattr(args, "command", None), "error": message}, indent=2
+        ))
+    else:
+        console.error(message)
+    return code
 
 
 if __name__ == "__main__":
