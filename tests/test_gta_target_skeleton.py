@@ -49,7 +49,7 @@ def test_hanim_node_id_is_reported_not_trusted(skeleton):
     conflicts = [d for d in resolution.diagnostics if d.code == "hanim-name-conflict"]
     # Every frame that has both a plugin id and a real GTA name disagrees.
     assert len(conflicts) == 31
-    assert skeleton.bones[0].resolved_tag is None   # unnamed container root
+    assert skeleton.bones[0].bone_id == -1        # unnamed container root
     assert skeleton.bones[3].hanim_id == 3          # stale, as measured
     assert skeleton.bones[3].resolved_tag == 51     # what actually gets written
 

@@ -56,11 +56,40 @@ __all__ = [
     "FBX_TIME_UNITS_PER_SECOND",
 ]
 
+#: Sentinel for lazily-populated caches: ``None`` is a meaningful value there.
+_UNSET = object()
+
 #: FBX stores times in 1/46186158000 s units (``FBXSDK_TIME_ONE_SECOND``).
 FBX_TIME_UNITS_PER_SECOND = 46186158000.0
 
 #: Key under which an :class:`AnimationCurve`'s single value channel is stored.
 VALUE_KEY = "__value__"
+
+#: **FBX stores every Euler angle in degrees**, both in a node's
+#: ``Properties70`` (``Lcl Rotation``, ``Lcl PreRotation``, ``Lcl
+#: PostRotation``) and in the ``Lcl Rotation``/``PreRotation`` animation
+#: curves.  This is a property of the format, not of a particular exporter:
+#: the file's ``GlobalSettings`` does not record it, and treating the values
+#: as radians silently scrambles any rig with rotations past ~2pi (a value of
+#: 765 degrees reads as 13.4 rad).  The conversion is applied exactly once,
+#: at the boundary, so the rest of the pipeline works in radians.
+FBX_EULER_UNITS_ARE_DEGREES = True
+DEGREES_TO_RADIANS = 3.141592653589793 / 180.0
+
+#: Euler order assumed when a ``Model`` record carries no ``RotationOrder``.
+#: **This is ``ZYX``, not ``XYZ``** -- it is the Autodesk FBX SDK's own default
+#: and the reference loaders' fallback.  It matters: the two orders differ by
+#: a transposition of the X and Z components, so reading a Mixamo clip as XYZ
+#: tilts the pelvis by ~90 degrees on average and puts the head below the hips
+#: for a third of the clip.  A file that *does* declare an order always wins.
+DEFAULT_ROTATION_ORDER = "ZYX"
+
+#: How close a sampled time must be to a key time to count *as* that key.
+#: FBX stores key times in seconds, and float32 seconds (what most FBX tools
+#: hand back) resolve to about 1e-7 s near 10 s.  Without this tolerance a
+#: key time read back from such a tool interpolates from the previous key and
+#: then rounds to the previous key's value.
+KEY_TIME_SNAP_SECONDS = 1e-6
 
 #: Default clip rate when the stack does not declare one.  FBX's own default.
 DEFAULT_FPS = 30.0
@@ -122,11 +151,56 @@ class KeyframeChannel:
         span = self.times_ms[hi] - self.times_ms[lo]
         if span <= 0.0:
             return self.values[lo]
+        # Snap to an exact key before anything else.  Key times are stored in
+        # seconds, so a caller passing a key time back -- or a float32 time
+        # read from another tool -- can land a few microseconds either side of
+        # it.  ``(t - t_lo) / span`` then loses most of its significant digits
+        # to cancellation: at 633.3333 ms the factor comes out 0.9999976 and
+        # ``v_lo + factor * (v_hi - v_lo)`` rounds straight back to ``v_lo``,
+        # silently returning the *previous* key's value.  The tolerance is set
+        # to what a float32 second actually resolves to (~1e-7 s) rather than
+        # to float64 epsilon, because that is the error being corrected.
+        # This must run *before* the CONSTANT check below: a CONSTANT key
+        # adjacent to the requested key would otherwise swallow it.
+        tolerance = max(span * 1e-9, KEY_TIME_SNAP_SECONDS * 1000.0)
+        if abs(time_ms - self.times_ms[hi]) <= tolerance:
+            return self.values[hi]
         if self.interpolation and lo < len(self.interpolation):
             if self.interpolation[lo] == 0:  # CONSTANT
                 return self.values[lo]
         factor = (time_ms - self.times_ms[lo]) / span
         return self.values[lo] + (self.values[hi] - self.values[lo]) * factor
+
+    def sample(self, times_ms: Sequence[float], default: float = 0.0) -> np.ndarray:
+        """Vectorised :meth:`value_at` over a list of times.
+
+        Same rules as the scalar path -- linear between keys, constant before
+        the first and after the last, and CONSTANT-interpolated keys hold
+        their left value -- but evaluated for a whole clip in one pass.
+        """
+        times = np.asarray(times_ms, dtype=np.float64)
+        if not self.times_ms:
+            return np.full(times.shape, float(default), dtype=np.float64)
+        keys = np.asarray(self.times_ms, dtype=np.float64)
+        values = np.asarray(self.values, dtype=np.float64)
+        lower = np.clip(np.searchsorted(keys, times, side="right") - 1, 0, keys.size - 1)
+        upper = np.minimum(lower + 1, keys.size - 1)
+        span = keys[upper] - keys[lower]
+        safe = np.where(span > 0.0, span, 1.0)
+        factor = (times - keys[lower]) / safe
+        out = values[lower] + (values[upper] - values[lower]) * factor
+        if self.interpolation:
+            flags = np.asarray(self.interpolation, dtype=np.int64)
+            out = np.where(flags[lower] == 0, values[lower], out)
+        out = np.where(times <= keys[0], values[0], out)
+        out = np.where(times >= keys[-1], values[-1], out)
+        # Same key-snapping as :meth:`value_at`: a time that is a hair below a
+        # key would otherwise interpolate ~99.9999% of the way and then round
+        # back to the previous key's value.
+        tolerance = np.maximum(span * 1e-9, KEY_TIME_SNAP_SECONDS * 1000.0)
+        exact = np.abs(times - keys[lower]) <= tolerance
+        out = np.where(exact, values[lower], out)
+        return out
 
     @property
     def time_range_ms(self) -> tuple[float, float]:
@@ -158,12 +232,29 @@ class SourceBone:
     geometric_transform: np.ndarray = field(default_factory=mat_identity)
     include_geometric_transform: bool = True
 
+    #: Rest values for channels the clip does not key.  A node with no
+    #: ``Lcl Translation`` curve keeps the translation its ``Model`` record
+    #: declares -- substituting zero would move every unanimated limb joint
+    #: onto its parent's origin and silently distort the rest pose.
+    rest_translation: np.ndarray = field(default_factory=lambda: np.zeros(3))
+    rest_scale: np.ndarray = field(default_factory=lambda: np.ones(3))
+
     #: Channel name (``"Lcl Rotation X"``) -> keyframe curve.
     curves: dict[str, KeyframeChannel] = field(default_factory=dict)
 
     kind: BoneKind = BoneKind.IGNORE
     depth: int = 0
     notes: list[str] = field(default_factory=list)
+
+    #: Derived-value caches, populated lazily by :meth:`_fixed_rotation` and
+    #: :meth:`_effective_geometric`.  Both are constant for the life of a
+    #: bone, so they are folded once instead of once per key.
+    _fixed_cache: object = field(
+        default=_UNSET, repr=False, compare=False
+    )
+    _geometric_cache: object = field(
+        default=_UNSET, repr=False, compare=False
+    )
 
     @property
     def is_root(self) -> bool:
@@ -196,15 +287,54 @@ class SourceBone:
     def euler_at(self, time_ms: float, prefix: str) -> list[float]:
         return [self.component(time_ms, f"{prefix} {axis}") for axis in ("X", "Y", "Z")]
 
+    def trs_at(self, time_ms: float) -> tuple[list[float], list[float], list[float]]:
+        """``(rotation, translation, scale)`` at a time, with rest fallbacks.
+
+        The fallback is the node's own ``Properties70`` value, never a bare
+        zero/one: an unkeyed channel is *not* an identity channel.  Rotation
+        is converted from FBX degrees to radians on the way out.
+        """
+        scale = DEGREES_TO_RADIANS
+        return (
+            [v * scale for v in self.euler_at(time_ms, "Lcl Rotation")],
+            [
+                self.component(time_ms, f"Lcl Translation {axis}", self.rest_translation[i])
+                for i, axis in enumerate("XYZ")
+            ],
+            [
+                self.component(time_ms, f"Lcl Scaling {axis}", self.rest_scale[i])
+                for i, axis in enumerate("XYZ")
+            ],
+        )
+
+    def sample(self, channel: str, times_ms: Sequence[float], default: float = 0.0) -> np.ndarray:
+        """Evaluate one channel at every time in one vectorised pass.
+
+        ``np.interp`` is only a valid shortcut between the *first* and *last*
+        key; outside that window FBX holds the terminal value, which is what
+        the frame range of an animation stack actually extends to.  Inside the
+        window the caller must use :meth:`KeyframeChannel.value_at`, so this
+        method reports a keyframe curve as unusable rather than lying about it.
+        """
+        curve = self.curves.get(channel)
+        times = np.asarray(times_ms, dtype=np.float64)
+        if curve is None or curve.is_empty:
+            return np.full(times.shape, float(default), dtype=np.float64)
+        first, last = curve.time_range_ms
+        if (times < first - 1e-9).any() or (times > last + 1e-9).any():
+            raise ValueError(
+                f"cannot batch-sample {channel!r}: frames span "
+                f"[{times.min():.4f}, {times.max():.4f}] ms but the curve only "
+                f"covers [{first:.4f}, {last:.4f}] ms; use per-frame evaluation"
+            )
+        return curve.sample(times, default)
+
     def local_matrix(self, time_ms: float | None = None) -> np.ndarray:
         """Rebuild the node's local matrix at a time from its curves."""
         if time_ms is None:
             return self.bind_local
-        return self.compose(
-            self.euler_at(time_ms, "Lcl Rotation"),
-            self.euler_at(time_ms, "Lcl Translation"),
-            self.euler_at(time_ms, "Lcl Scaling") or [1.0, 1.0, 1.0],
-        )
+        rotation, translation, scale = self.trs_at(time_ms)
+        return self.compose(rotation, translation, scale)
 
     def compose(
         self,
@@ -213,20 +343,65 @@ class SourceBone:
         scale: Sequence[float],
     ) -> np.ndarray:
         """Full FBX MABB/ROS + geometric transform composition."""
-        from ..core.mathx import quat_inverse, quat_multiply
+        return self.compose_many(
+            np.asarray([euler], dtype=np.float64),
+            np.asarray([translation], dtype=np.float64),
+            np.asarray([scale], dtype=np.float64),
+        )[0]
 
-        rotation = euler_to_quat(euler, self.rotation_order)
-        if np.any(np.abs(self.pre_rotation) > 1e-12):
-            rotation = quat_multiply(
-                quat_multiply(self.pre_rotation, rotation),
-                quat_inverse(self.post_rotation),
-            )
-        matrix = mat_from_trs(translation, rotation, scale)
-        if self.include_geometric_transform:
-            geometric = self.geometric_transform
-            if geometric is not None and not np.allclose(geometric, mat_identity(), atol=1e-12):
-                matrix = matrix @ geometric
-        return matrix
+    def compose_many(
+        self,
+        euler: np.ndarray,
+        translation: np.ndarray,
+        scale: np.ndarray,
+    ) -> np.ndarray:
+        """Batched :meth:`compose` for ``(n, 3)`` inputs.
+
+        Baking a clip evaluates one local transform per key per bone, which
+        is tens of thousands of quaternions.  The pre/post rotation pair and
+        the geometric transform are constant per bone, so they are folded
+        once and the per-key work is vectorised instead of running a Python
+        loop over every key.
+        """
+        from ..core.mathx import euler_to_quat_many, mat_from_trs_many
+
+        euler = np.atleast_2d(np.asarray(euler, dtype=np.float64))
+        translation = np.atleast_2d(np.asarray(translation, dtype=np.float64))
+        scale = np.atleast_2d(np.asarray(scale, dtype=np.float64))
+        rotation = euler_to_quat_many(euler, self.rotation_order)
+        fixed = self._fixed_rotation()
+        if fixed is not None:
+            rotation = _quat_multiply_many(fixed[None, :], rotation)
+        matrices = mat_from_trs_many(translation, rotation, scale)
+        geometric = self._effective_geometric()
+        if geometric is not None:
+            matrices = matrices @ geometric
+        return matrices
+
+    def _fixed_rotation(self) -> np.ndarray | None:
+        """``pre * post^-1``, cached, or ``None`` when both are identity."""
+        if self._fixed_cache is _UNSET:
+            pre = np.asarray(self.pre_rotation, dtype=np.float64)
+            post = np.asarray(self.post_rotation, dtype=np.float64)
+            identity = np.array([0.0, 0.0, 0.0, 1.0])
+            if (np.allclose(pre, identity, atol=1e-12)
+                    and np.allclose(post, identity, atol=1e-12)):
+                self._fixed_cache = None
+            else:
+                from ..core.mathx import quat_inverse, quat_multiply
+
+                self._fixed_cache = quat_multiply(pre, quat_inverse(post))
+        return self._fixed_cache
+
+    def _effective_geometric(self) -> np.ndarray | None:
+        """The geometric transform when it has to be applied, else ``None``."""
+        if self._geometric_cache is _UNSET:
+            value = None
+            if self.include_geometric_transform and self.geometric_transform is not None:
+                if not np.allclose(self.geometric_transform, mat_identity(), atol=1e-12):
+                    value = self.geometric_transform
+            self._geometric_cache = value
+        return self._geometric_cache
 
     def __repr__(self) -> str:  # pragma: no cover - debugging aid
         return f"SourceBone({self.name!r}, parent={self.parent}, children={self.children})"
@@ -508,22 +683,39 @@ def _hierarchy_from_connections(document: FbxDocument, valid_ids: set[int]):
 
 
 def _make_bone(node: FbxNode, fbx_id: int, include_geometric: bool) -> SourceBone:
-    order = node.string("RotationOrder", "DefaultRotationOrder") or "XYZ"
+    """Build a source bone from a ``Model`` record.
+
+    FBX 7.4 keeps the local TRS in the node's ``Properties70`` block, not in
+    its property list.  Reading the legacy names positionally instead makes
+    every bone of a rig collapse onto the origin -- silent, and wrong -- so
+    both layouts are accepted and Properties70 wins when it is present.
+    """
+    order = (
+        node.string("RotationOrder", "DefaultRotationOrder")
+        or node.prop70("RotationOrder", 4, "")
+        or DEFAULT_ROTATION_ORDER
+    )
     if order not in ("XYZ", "XZY", "YXZ", "YZX", "ZXY", "ZYX"):
-        order = "XYZ"
+        order = DEFAULT_ROTATION_ORDER
+
+    def local(name: str, *legacy: str, default: Sequence[float] = (0.0, 0.0, 0.0)):
+        if node.find("Properties70") is not None:
+            return node.prop70_vec3(name, default)
+        return node.vec3(legacy[0] if legacy else name, default)
+
     bone = SourceBone(
         name=node.primary_name or node.string("Name") or f"node_{fbx_id}",
         fbx_id=fbx_id,
         model_type=node.subclass or node.string("Type", "Null") or "Null",
         rotation_order=order,
-        pre_rotation=_euler_prop(node, "PreRotation", order),
-        post_rotation=_euler_prop(node, "PostRotation", order),
+        pre_rotation=_euler_prop(node, "Lcl PreRotation", "PreRotation", order),
+        post_rotation=_euler_prop(node, "Lcl PostRotation", "PostRotation", order),
         geometric_transform=_geometric_transform(node),
         include_geometric_transform=include_geometric,
     )
-    translation = node.vec3("Lcl Translation")
-    rotation_euler = node.vec3("Lcl Rotation")
-    scale = node.vec3("Lcl Scaling", (1.0, 1.0, 1.0))
+    translation = local("Lcl Translation", "Translation")
+    rotation_euler = [v * DEGREES_TO_RADIANS for v in local("Lcl Rotation", "Rotation")]
+    scale = local("Lcl Scaling", "Scaling", default=(1.0, 1.0, 1.0))
     bone.bind_local = bone.compose(rotation_euler, translation, scale)
     try:
         t, q, s = mat_decompose(bone.bind_local)
@@ -534,11 +726,18 @@ def _make_bone(node: FbxNode, fbx_id: int, include_geometric: bool) -> SourceBon
     bone.bind_local_translation = t
     bone.bind_local_quat = q
     bone.bind_local_scale = s
+    # Unkeyed channels hold these rest values for the whole clip.
+    bone.rest_translation = np.array(translation, dtype=np.float64)
+    bone.rest_scale = np.array(scale, dtype=np.float64)
     return bone
 
 
-def _euler_prop(node: FbxNode, name: str, order: str) -> np.ndarray:
-    values = node.get(name)
+def _euler_prop(node: FbxNode, name: str, legacy: str, order: str) -> np.ndarray:
+    """A pre/post rotation as a quaternion, from either FBX layout."""
+    if node.find("Properties70") is not None:
+        values = node.prop70_vec3(name)
+    else:
+        values = node.get(legacy)
     if values is None:
         return np.array([0.0, 0.0, 0.0, 1.0])
     try:
@@ -546,7 +745,8 @@ def _euler_prop(node: FbxNode, name: str, order: str) -> np.ndarray:
     except (TypeError, ValueError):
         return np.array([0.0, 0.0, 0.0, 1.0])
     if len(vector) == 3:
-        return euler_to_quat(vector[:3], order)
+        # FBX stores pre/post rotation in degrees like every other Euler.
+        return euler_to_quat([v * DEGREES_TO_RADIANS for v in vector[:3]], order)
     if len(vector) == 4:
         return quat_normalize(np.array(vector, dtype=np.float64))
     return np.array([0.0, 0.0, 0.0, 1.0])
@@ -916,20 +1116,35 @@ def _build_clips(
         )
         non_linear = 0
         for bone in members:
+            # Sample every curve in one vectorised pass, then fold the
+            # constant per-bone parts (pre/post rotation, geometric) once.
+            euler = np.empty((len(times), 3), dtype=np.float64)
+            translation = np.empty((len(times), 3), dtype=np.float64)
+            scale = np.empty((len(times), 3), dtype=np.float64)
+            for column, axis in enumerate(("X", "Y", "Z")):
+                euler[:, column] = (
+                    bone.sample(f"Lcl Rotation {axis}", times, 0.0) * DEGREES_TO_RADIANS
+                )
+                translation[:, column] = bone.sample(
+                    f"Lcl Translation {axis}", times, bone.rest_translation[column]
+                )
+                scale[:, column] = bone.sample(
+                    f"Lcl Scaling {axis}", times, bone.rest_scale[column]
+                )
+            matrices = bone.compose_many(euler, translation, scale)
             rows = np.zeros((len(times), 7), dtype=np.float64)
-            for frame, time_ms in enumerate(times):
-                matrix = bone.local_matrix(time_ms)
+            for frame in range(len(times)):
                 try:
-                    t, q, _ = mat_decompose(matrix)
+                    t, q, _ = mat_decompose(matrices[frame])
                 except ValueError:
                     t = bone.bind_local_translation
                     q = bone.bind_local_quat
                 rows[frame, 0:4] = q
                 rows[frame, 4:7] = t
-                for curve in bone.curves.values():
-                    if any(flag not in (0, 1, 3, 4) for flag in curve.interpolation):
-                        non_linear += 1
-                        break
+            for curve in bone.curves.values():
+                if any(flag not in (0, 1, 3, 4) for flag in curve.interpolation):
+                    non_linear += 1
+                    break
             clip.poses[bone.index] = rows
         clip.source_animated_bones = sorted(clip.poses)
         clip.non_linear_keys = non_linear

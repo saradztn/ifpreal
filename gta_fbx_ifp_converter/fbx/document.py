@@ -280,6 +280,61 @@ class FbxNode:
                 out.append(decode_fbx_string(entry.properties[0].value))
         return out
 
+    def prop70_vec3(
+        self, name: str, default: Sequence[float] = (0.0, 0.0, 0.0)
+    ) -> list[float]:
+        """Read a ``Vector3D`` / ``Vector`` / ``Color`` Properties70 entry.
+
+        FBX 7.4 writes ``Lcl Translation``, ``Lcl Rotation``, ``Lcl Scaling``
+        and the pre/post rotations as ``P`` records with the three components
+        at positions 4, 5, 6.  They are *not* properties of the node itself,
+        so reading them positionally yields zeros for a whole rig.
+        """
+        holder = self.find("Properties70")
+        if holder is None:
+            return list(default)
+        target = name.casefold()
+        for entry in holder.children:
+            if not entry.properties:
+                continue
+            key = entry.properties[0]
+            if not isinstance(key.value, (str, bytes)):
+                continue
+            if decode_fbx_string(key.value).casefold() != target:
+                continue
+            values = [p.value for p in entry.properties[1:]]
+            numbers: list[float] = []
+            for value in values:
+                if isinstance(value, (int, float)):
+                    numbers.append(float(value))
+                elif isinstance(value, (list, tuple)):
+                    numbers.extend(float(v) for v in value)
+            if len(numbers) >= 3:
+                return numbers[:3]
+            if numbers:
+                return [numbers[0], 0.0, 0.0]
+            return list(default)
+        return list(default)
+
+    def prop70_transform(
+        self, *names: str, default: Sequence[float] = (0.0, 0.0, 0.0)
+    ) -> list[float]:
+        """First of ``names`` that resolves to a vector in Properties70."""
+        for name in names:
+            holder = self.find("Properties70")
+            if holder is None:
+                return list(default)
+            target = name.casefold()
+            for entry in holder.children:
+                if not entry.properties:
+                    continue
+                key = entry.properties[0]
+                if not isinstance(key.value, (str, bytes)):
+                    continue
+                if decode_fbx_string(key.value).casefold() == target:
+                    return self.prop70_vec3(name, default)
+        return list(default)
+
     def vec3(self, name: str, default: Sequence[float] = (0.0, 0.0, 0.0)) -> list[float]:
         prop = self.get_prop(name)
         return prop.as_vector(3) if prop else list(default)

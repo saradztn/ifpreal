@@ -91,7 +91,7 @@ class GtaBone:
 
     @property
     def bone_id(self) -> int:
-        """Bone id to write into the IFP, or ``-1`` when the DFF has no HAnim.
+        """Bone id to write into the IFP, or ``-1`` when the frame has none.
 
         This is the *resolved* tag.  The DFF's raw HAnim ``node_id`` stays on
         :attr:`hanim_id` for diagnostics but is not what the engine is fed.
@@ -99,6 +99,11 @@ class GtaBone:
         if self.resolved_tag is not None:
             return int(self.resolved_tag)
         return int(self.hanim_id) if self.hanim_id is not None else -1
+
+    @property
+    def is_addressable(self) -> bool:
+        """True when this frame can carry an IFP track."""
+        return self.bone_id >= 0
 
     @property
     def label(self) -> str:
@@ -428,10 +433,11 @@ def load_skeleton(path: str, *, validate: bool = True) -> GtaSkeleton:
     )
     for bone in bones:
         tag = resolution.tag_of_frame.get(bone.index)
-        if tag is None:
-            continue
-        bone.resolved_tag = int(tag)
-        bone.canonical_tag = SaBoneTag(tag) if tag in _KNOWN_TAGS else None
+        # ``-1`` means "this frame has no addressable bone", which is what
+        # :attr:`GtaBone.bone_id` must report -- falling back to the stale
+        # HAnim node id here would claim a bone the frame does not own.
+        bone.resolved_tag = -1 if tag is None else int(tag)
+        bone.canonical_tag = SaBoneTag(tag) if tag is not None and tag in _KNOWN_TAGS else None
     skeleton.tag_resolution = resolution
 
     # The skin indexes the HAnim bone array, so it inherits the same stale

@@ -28,6 +28,8 @@ __all__ = [
     "quat_to_matrix",
     "matrix_to_quat",
     "quat_multiply",
+    "quat_multiply_many",
+    "quat_normalize_many",
     "quat_conjugate",
     "quat_inverse",
     "quat_normalize",
@@ -35,9 +37,11 @@ __all__ = [
     "quat_from_axis_angle",
     "quat_angle_between",
     "quat_slerp",
+    "quat_angle_deg",
     "quat_from_matrix",
     "mat_identity",
     "mat_from_trs",
+    "mat_from_trs_many",
     "mat_translation",
     "mat_rotation",
     "mat_scale",
@@ -50,6 +54,7 @@ __all__ = [
     "mat_to_quat",
     "orthonormalize",
     "euler_to_quat",
+    "euler_to_quat_many",
     "quat_to_euler",
     "remap_unit_interval",
 ]
@@ -111,6 +116,30 @@ def quat_multiply(
             aw * bw - ax * bx - ay * by - az * bz,
         ],
         dtype=np.float64,
+    )
+
+
+def quat_multiply_many(
+    a: np.ndarray,
+    b: np.ndarray,
+) -> np.ndarray:
+    """Row-wise Hamilton product for ``(n, 4)`` XYZW quaternion stacks."""
+    a = np.atleast_2d(np.asarray(a, dtype=np.float64))
+    b = np.atleast_2d(np.asarray(b, dtype=np.float64))
+    if a.shape[0] == 1 and b.shape[0] > 1:
+        a = np.broadcast_to(a, b.shape)
+    elif b.shape[0] == 1 and a.shape[0] > 1:
+        b = np.broadcast_to(b, a.shape)
+    ax, ay, az, aw = a[:, 0], a[:, 1], a[:, 2], a[:, 3]
+    bx, by, bz, bw = b[:, 0], b[:, 1], b[:, 2], b[:, 3]
+    return np.stack(
+        [
+            aw * bx + ax * bw + ay * bz - az * by,
+            aw * by - ax * bz + ay * bw + az * bx,
+            aw * bz + ax * by - ay * bx + az * bw,
+            aw * bw - ax * bx - ay * by - az * bz,
+        ],
+        axis=-1,
     )
 
 
@@ -198,6 +227,19 @@ def quat_angle_between(
     return 2.0 * math.acos(dot)
 
 
+def quat_angle_deg(
+    a: Sequence[float] | np.ndarray,
+    b: Sequence[float] | np.ndarray,
+) -> float:
+    """Smallest rotation angle in degrees between two orientations.
+
+    Sign-agnostic: ``q`` and ``-q`` are the same rotation, so the dot product
+    is taken in absolute value.
+    """
+    dot = abs(float(np.dot(quat_normalize(a), quat_normalize(b))))
+    return math.degrees(2.0 * math.acos(min(1.0, max(-1.0, dot))))
+
+
 def quat_slerp(
     a: Sequence[float] | np.ndarray,
     b: Sequence[float] | np.ndarray,
@@ -228,17 +270,63 @@ def euler_to_quat(
 
     ``order`` follows the FBX/Maya convention: the letters list the axes in
     *application* order, so ``"ZYX"`` means "rotate about Z, then Y, then X".
+    ``rotation`` is always indexed by axis (``[X, Y, Z]``), never by position
+    in ``order`` -- pairing the two positionally is what silently swaps X and
+    Z for every non-``XYZ`` rig.
     """
     rotation = np.asarray(rotation, dtype=np.float64).reshape(3)
     if len(order) != 3 or set(order) != {"X", "Y", "Z"}:
         raise ValueError(f"Unsupported Euler order: {order!r}")
     axis_index = {"X": 0, "Y": 1, "Z": 2}
     result = np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float64)
-    for letter, angle in zip(order, rotation):
+    for letter in order:
         result = quat_multiply(
-            result, quat_from_axis_angle(_unit_axis(axis_index[letter]), float(angle))
+            result,
+            quat_from_axis_angle(
+                _unit_axis(axis_index[letter]), float(rotation[axis_index[letter]])
+            ),
         )
     return quat_normalize(result)
+
+
+def euler_to_quat_many(
+    rotation: np.ndarray,
+    order: str = "XYZ",
+) -> np.ndarray:
+    """Vectorised :func:`euler_to_quat` for an ``(n, 3)`` stack of Euler angles.
+
+    Identical maths, evaluated for every key at once: baking a clip needs one
+    rotation per key per bone, and a Python loop over that is the single
+    hottest path in the FBX stage.
+    """
+    rotation = np.atleast_2d(np.asarray(rotation, dtype=np.float64))
+    if len(order) != 3 or set(order) != {"X", "Y", "Z"}:
+        raise ValueError(f"Unsupported Euler order: {order!r}")
+    axis_index = {"X": 0, "Y": 1, "Z": 2}
+    result = np.zeros((rotation.shape[0], 4), dtype=np.float64)
+    result[:, 3] = 1.0
+    for letter in order:
+        # ``rotation`` is indexed by axis, not by position in ``order``; see
+        # :func:`euler_to_quat`.  The two differ whenever ``order != "XYZ"``.
+        angle = rotation[:, axis_index[letter]]
+        axis = np.zeros(3, dtype=np.float64)
+        axis[axis_index[letter]] = 1.0
+        half = angle * 0.5
+        sin = np.sin(half)
+        step = np.empty((rotation.shape[0], 4), dtype=np.float64)
+        step[:, 0] = axis[0] * sin
+        step[:, 1] = axis[1] * sin
+        step[:, 2] = axis[2] * sin
+        step[:, 3] = np.cos(half)
+        result = quat_multiply_many(result, step)
+    return quat_normalize_many(result)
+
+
+def quat_normalize_many(quats: np.ndarray) -> np.ndarray:
+    quats = np.atleast_2d(np.asarray(quats, dtype=np.float64))
+    norms = np.linalg.norm(quats, axis=1, keepdims=True)
+    norms[norms < 1e-12] = 1.0
+    return quats / norms
 
 
 def _unit_axis(index: int) -> list[float]:
@@ -312,6 +400,46 @@ def mat_from_trs(
 ) -> np.ndarray:
     """Compose ``T @ R @ S``."""
     return mat_translation(translation) @ mat_rotation(rotation) @ mat_scale(scale)
+
+
+def mat_from_trs_many(
+    translation: np.ndarray,
+    rotation: np.ndarray,
+    scale: np.ndarray | None = None,
+) -> np.ndarray:
+    """Batched ``T @ R @ S`` for ``(n, 3)`` / ``(n, 4)`` / ``(n, 3)`` stacks.
+
+    Returns an ``(n, 4, 4)`` array of column-vector matrices.
+    """
+    translation = np.atleast_2d(np.asarray(translation, dtype=np.float64))
+    rotation = np.atleast_2d(np.asarray(rotation, dtype=np.float64))
+    count = max(translation.shape[0], rotation.shape[0])
+    if scale is None:
+        scale = np.ones((count, 3), dtype=np.float64)
+    else:
+        scale = np.atleast_2d(np.asarray(scale, dtype=np.float64))
+    x, y, z, w = rotation[:, 0], rotation[:, 1], rotation[:, 2], rotation[:, 3]
+    xx, yy, zz = x * x, y * y, z * z
+    xy, xz, yz = x * y, x * z, y * z
+    wx, wy, wz = w * x, w * y, w * z
+    # T @ R @ S scales the *columns* of R, exactly as the scalar
+    # ``mat_translation @ mat_rotation @ mat_scale`` does.
+    out = np.empty((count, 4, 4), dtype=np.float64)
+    out[:, :, 0] = np.stack(
+        [1.0 - 2.0 * (yy + zz), 2.0 * (xy + wz), 2.0 * (xz - wy), np.zeros(count)],
+        axis=-1,
+    ) * scale[:, 0:1]
+    out[:, :, 1] = np.stack(
+        [2.0 * (xy - wz), 1.0 - 2.0 * (xx + zz), 2.0 * (yz + wx), np.zeros(count)],
+        axis=-1,
+    ) * scale[:, 1:2]
+    out[:, :, 2] = np.stack(
+        [2.0 * (xz + wy), 2.0 * (yz - wx), 1.0 - 2.0 * (xx + yy), np.zeros(count)],
+        axis=-1,
+    ) * scale[:, 2:3]
+    out[:, :3, 3] = translation[:, :3]
+    out[:, 3, 3] = 1.0
+    return out
 
 
 def mat_mul(a: np.ndarray, b: np.ndarray) -> np.ndarray:
