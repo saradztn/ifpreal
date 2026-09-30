@@ -57,7 +57,9 @@ setup(
     long_description_content_type="text/markdown",
     license="MIT",
     python_requires=">=3.10",
-    packages=find_packages(include=["gta_fbx_ifp_converter", "gta_fbx_ifp_converter.*"]),
+    packages=find_packages(include=["gta_fbx_ifp_converter",
+                                    "gta_fbx_ifp_converter.*",
+                                    "gui"]),
     py_modules=["cli"],
     install_requires=[
         "numpy>=1.24",
