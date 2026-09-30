@@ -169,7 +169,10 @@ output looks fine" is not a diagnostic:
 - `reversed_joint` — an elbow or knee bending backwards
 - `root_orientation` — the character stands upside down
 - `invalid_quaternion` — a non-unit or NaN quaternion
-- `axis_mismatch` — the rigs do not share a convention
+- `axis_mismatch` — the ped's up axis does not point up, the Y-up/Z-up swap.
+  Measured from the head bone's rotation against the DFF's own bind frame;
+  the earlier version read the head's *translation*, and IFP stores
+  translation on the root only, so that version could never fire
 - `invalid_hanim_id` — an id that is not in the DFF
 - `corrupt_anp3` — a header or frame that does not parse
 
@@ -193,10 +196,17 @@ Real bugs, each with the test that catches it:
   the stage table listed six implemented stages as missing.
 - `--json` printed a title line and the human report ahead of the JSON, so
   the output could not be parsed.
+- The "drop negligible keys" checkbox on the settings page did nothing; no
+  reduction code existed. A control that looks like it works is worse than
+  none.
+- Three separate diagnostics crashed on the errors they were written to
+  report, because `GtaSkeleton` has `source_path` and no `.name`.
+- A failed validation could print a custom headline and never the words
+  `FAILED VALIDATION`, which is the phrase the user is told to look for.
 
 ```
 $ pytest -q
-180 passed
+188 passed
 ```
 
 The resampling one is worth singling out: on a fast rotation the previous
@@ -235,7 +245,7 @@ gui/                       the window
     jobs.py                background threads
     preview.py             the side-by-side view
 examples/                  the MTA resource and a generated IFP
-tests/                     180 tests
+tests/                     188 tests
 testdata/                  a real FBX and a real DFF
 docs/                      format notes
 ```

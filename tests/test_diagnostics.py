@@ -214,3 +214,127 @@ class TestFullDiagnosticRun:
                     if f.defect is Defect.MIRRORED_MAPPING]
         assert mirrored, "the known ped asymmetry should still be reported"
         assert all(not f.fatal for f in mirrored)
+
+
+class TestAxisConvention:
+    """The Y-up/Z-up swap, which produces a file that loads and plays while
+    the character is lying down."""
+
+    def test_the_real_conversion_is_upright(self, converted):
+        _, skeleton, parse, _, _ = converted
+        report = diagnostics.check_axis_convention(parse(), skeleton)
+        assert report.is_clean, [f.describe() for f in report.findings]
+
+    def test_a_character_on_its_side_is_caught(self, converted):
+        _, skeleton, parse, _, _ = converted
+        parsed = parse()
+        tilted = mathx.quat_from_axis_angle([1.0, 0.0, 0.0], math.pi / 2)
+        for animation in parsed.animations:
+            for obj in animation.objects:
+                obj.frames = [
+                    type(f)(
+                        rotation_raw=tuple(
+                            int(round(v * 4096)) for v in mathx.quat_multiply(
+                                tilted,
+                                np.asarray(f.rotation, float)
+                                / float(np.linalg.norm(f.rotation)))),
+                        time_units=f.time_units,
+                        translation_raw=f.translation_raw)
+                    for f in obj.frames]
+        report = diagnostics.check_axis_convention(parsed, skeleton)
+        assert not report.is_clean, "a ped lying on its side went unreported"
+        assert report.has(Defect.AXIS_MISMATCH)
+
+    def test_it_needs_a_skeleton_and_says_nothing_without_one(self, converted):
+        """There is no bind frame without a DFF, so no definition of "up"."""
+        _, _, parse, _, _ = converted
+        assert diagnostics.check_axis_convention(parse()).is_clean
+
+    def test_only_the_root_carries_a_translation(self, converted):
+        """IFP stores translation on the root object only.
+
+        The check that used the head's translation to spot an axis swap could
+        therefore never fire: the head never has a translation to look at. The
+        current check reads the head's rotation instead, and this pins the
+        fact that made the change necessary.
+        """
+        _, _, parse, _, _ = converted
+        parsed = parse()
+        with_translation = [
+            o.name for o in parsed.animations[0].objects
+            if o.frames and o.frames[0].translation_raw is not None]
+        assert with_translation == ["Root"], (
+            f"only the root carries a translation, but {with_translation} do")
+        head = next(o for o in parsed.animations[0].objects
+                    if o.bone_id == 5)
+        assert head.frames[0].translation_raw is None
+
+
+def _validation_results():
+    """Every ValidationResult the test suite can build without a file."""
+    from gta_fbx_ifp_converter.validate.validator import ValidationResult
+
+    return [
+        ValidationResult(passed=True, headline="ok"),
+        ValidationResult(passed=False, headline="a generated IFP that does "
+                                               "not read back"),
+    ]
+
+
+class TestMandatedMessages:
+    """The exact strings the brief requires, checked verbatim.
+
+    A user searching their logs for one of these has to find it. "Close
+    enough" here means the message they were told to look for is not there.
+    """
+
+    def test_no_animated_armature(self):
+        import types
+
+        report = diagnostics.DiagnosticReport()
+        diagnostics.check_source(
+            types.SimpleNamespace(bones=[], animated_clips=[]), report)
+        assert [f.message for f in report.findings] == [
+            "No animated Armature found."]
+
+    def test_incomplete_mapping_blocks_and_says_so(self):
+        from gta_fbx_ifp_converter.mapping import MappingBlocked, require_exportable
+
+        class Blocked:
+            warnings: list = []
+            errors: list = ["nothing mapped"]
+
+            def quality_score(self):
+                return 0.0
+
+        with pytest.raises(MappingBlocked) as raised:
+            require_exportable(Blocked())
+        assert raised.value.reasons, "a block with no reason cannot be acted on"
+
+    def test_failed_validation_is_stated_in_those_words(self):
+        from gta_fbx_ifp_converter.validate.validator import ValidationResult
+
+        # A failure has to be legible as a failure, not merely falsy: the
+        # user is told to look for these words, and "passed: false" in a
+        # JSON blob is not what anybody reads.
+        failures = [r for r in _validation_results() if not r.passed]
+        for result in failures:
+            text = result.describe()
+            assert "FAILED" in text.upper(), text
+        successes = [r for r in _validation_results() if r.passed]
+        for result in successes:
+            assert "FAILED" not in result.describe().upper()
+
+    def test_a_ped_with_no_hanim_skeleton_is_named_as_such(self):
+        import types
+
+        report = diagnostics.DiagnosticReport()
+        diagnostics.check_target(
+            types.SimpleNamespace(
+                bones=[types.SimpleNamespace(is_addressable=False,
+                                            name=" Root", bone_id=0)],
+                has_hanim=False),
+            report)
+        assert report.findings, "a ped with no usable ids must be reported"
+        text = " ".join(f.message for f in report.findings).lower()
+        assert "hanim" in text

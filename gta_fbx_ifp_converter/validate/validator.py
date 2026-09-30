@@ -124,7 +124,15 @@ class ValidationResult:
         return sorted(self.rotation, key=lambda s: -s.max_error)[:count]
 
     def describe(self) -> str:
-        lines = [self.headline or ("PASSED VALIDATION" if self.passed else "FAILED VALIDATION")]
+        # The verdict always leads, in those words.  A custom headline used
+        # to replace it entirely, so a failure could be reported as anything
+        # at all and never as FAILED VALIDATION -- which is the phrase the
+        # user is told to look for, and the one a script greps for.  The
+        # headline is kept, on the next line, as the detail.
+        verdict = "PASSED VALIDATION" if self.passed else "FAILED VALIDATION"
+        lines = [verdict]
+        if self.headline and verdict not in self.headline:
+            lines.append(f"  {self.headline}")
         lines.append(
             f"  {self.bones_checked} bones, {self.keys_checked} keys; "
             f"angle max {self.max_angle_deg:.4f} deg, mean "

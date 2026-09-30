@@ -160,6 +160,18 @@ def check_source(rig, report: DiagnosticReport) -> DiagnosticReport:
     return report
 
 
+def _skeleton_label(skeleton) -> str:
+    """A short name for a ped, for use in a message.
+
+    `GtaSkeleton` has no `.name`; the path it was read from is the only
+    thing that identifies it. Assumed otherwise, the two error paths here
+    raised AttributeError on the very errors they exist to report, so a
+    ped with no HAnim ids produced a traceback instead of a sentence.
+    """
+    path = getattr(skeleton, "source_path", None)
+    return os.path.basename(path) if path else "target"
+
+
 def check_target(skeleton, report: DiagnosticReport) -> DiagnosticReport:
     """The target DFF must resolve a usable HAnim skeleton.
 
@@ -172,14 +184,14 @@ def check_target(skeleton, report: DiagnosticReport) -> DiagnosticReport:
             Defect.NO_HANIM_SKELETON,
             "the target DFF has no bones the game can animate; it has no "
             "HAnim plugin, so it is not a ped skeleton",
-            where=skeleton.name or "target",
+            where=_skeleton_label(skeleton),
         )
         return report
     if not any(b.resolved_tag is not None for b in addressable):
         report.add(
             Defect.NO_HANIM_SKELETON,
             "the target DFF's bones have no HAnim ids",
-            where=skeleton.name or "target",
+            where=_skeleton_label(skeleton),
         )
     return report
 
@@ -236,7 +248,6 @@ def check_side_swaps(
 
 def check_mirrored_limbs(
     mapping: MappingResult,
-    source_bones: Sequence,
     correction=None,
     report: DiagnosticReport | None = None,
     tolerance_deg: float = MIRROR_TOLERANCE_DEG,
@@ -514,34 +525,90 @@ def _find_object(parsed: ParsedIfp, bone_id: int):
 
 
 def check_axis_convention(
-    parsed: ParsedIfp, report: DiagnosticReport
+    parsed: ParsedIfp,
+    skeleton=None,
+    report: DiagnosticReport | None = None,
 ) -> DiagnosticReport:
-    """Look for a coordinate swap, which shows up as a body rotated 90 degrees."""
+    """The ped's own up axis must still point up.
+
+    A file whose axes were swapped -- the classic FBX Y-up into GTA Z-up
+    mistake -- produces an animation that loads and plays while the character
+    is lying down or tumbling. The IFP has no up axis of its own; the only
+    thing that carries one is the *ped's* bind frame, taken from the DFF.
+
+    The measurement is the head bone's local up axis, animated, expressed in
+    the ped's own world frame. In a bind pose on male01.dff that axis is
+    [0, 0, 1]: the ped's Z, straight up. A file that swapped the axes puts it
+    somewhere else entirely, and the average over the animation says so.
+
+    An earlier version of this check looked at the head's *translation*, which
+    cannot work: IFP stores translation on the root object only, so the head
+    never has any and the check could not fire once. It is replaced rather
+    than fixed, because a check that has never produced a finding is not a
+    check, and the reason it could not is worth not repeating.
+
+    It needs a skeleton: without one there is no bind frame and so no
+    definition of "up" for this particular ped.
+    """
+    report = report if report is not None else DiagnosticReport()
+    if skeleton is None:
+        return report
+
+    from ..core import mathx
+
+    head = next((b for b in skeleton.bones if b.name.strip() == "Head"), None)
+    if head is None:
+        return report
+    bind = np.asarray(head.bind_local_quat, dtype=float)[:4]
+    bind /= max(float(np.linalg.norm(bind)), 1e-12)
+    # The bone's up axis, in the ped's own frame, from the DFF's bind pose.
+    up_in_bone = np.array([0.0, 0.0, 1.0])
+    up_at_bind = mathx.quat_to_matrix(bind)[:3, :3] @ up_in_bone
+    ped_up = np.array([0.0, 0.0, 1.0])      # GTA is Z-up
+    if abs(float(np.dot(up_at_bind, ped_up))) < 0.9:
+        # This ped's head is not laid out the way the check assumes, so
+        # saying nothing beats misreading it.
+        return report
+
     for animation in parsed.animations:
-        head = next(
-            (o for o in animation.objects if o.bone_id == 5), None
-        )
-        spine = next(
-            (o for o in animation.objects if o.bone_id in (2, 3)), None
-        )
-        if head is None or spine is None or not head.frames or not spine.frames:
+        obj = next((o for o in animation.objects if o.bone_id == head.bone_id),
+                   None)
+        if obj is None or not obj.frames:
             continue
-        # In the ped's own frame the head sits above the spine.  A file whose
-        # axes were swapped has that relationship turned on its side, and the
-        # head's offset from the spine points along the wrong axis.
-        offset = head.translation_array()
-        if offset is None:
+        total = np.zeros(3)
+        for frame in obj.frames:
+            q = np.asarray(frame.rotation, dtype=float)[:4]
+            q = q / max(float(np.linalg.norm(q)), 1e-12)
+            # Where this key sends the bone's own up axis.
+            swung = mathx.quat_to_matrix(q)[:3, :3] @ up_in_bone
+            total += swung
+        mean = total / len(obj.frames)
+        norm = float(np.linalg.norm(mean))
+        if norm < 1e-6:
             continue
-        dominant = int(np.argmax(np.abs(offset[len(offset) // 2])))
-        if dominant == 0:
+        mean /= norm
+        # A ped that is upright, however it moves, keeps its head's up axis
+        # pointing up on average. One that is on its side does not.
+        alignment = float(np.dot(mean, ped_up))
+        if alignment < MIN_UP_ALIGNMENT:
             report.add(
                 Defect.AXIS_MISMATCH,
-                f"animation {animation.name!r}: the head's translation is "
-                f"largest along the ped's first axis; a GTA ped's head sits "
-                f"along its vertical, so the file's axes look swapped",
+                f"animation {animation.name!r}: the head's up axis points "
+                f"{np.degrees(math.acos(max(-1.0, min(1.0, alignment)))):.0f} "
+                f"degrees away from vertical, averaged over the whole clip. A "
+                f"standing ped's head points up whatever it does, so the file's "
+                f"axes do not match the ped's -- this is the Y-up/Z-up swap.",
                 where=animation.name,
+                measured=alignment,
+                expected=1.0,
             )
     return report
+
+
+#: How upright a ped's head must stay on average.  A dancer's head moves, but
+#: over a whole clip the average stays near vertical; a character lying on
+#: its back reads about 0.
+MIN_UP_ALIGNMENT = 0.5
 
 
 def check_hanim_ids(
@@ -555,7 +622,7 @@ def check_hanim_ids(
                 report.add(
                     Defect.INVALID_HANIM_ID,
                     f"bone {obj.name!r} drives HAnim id {obj.bone_id}, which "
-                    f"{os.path.basename(skeleton.source_path or 'this ped')} does not have",
+                    f"{_skeleton_label(skeleton)} does not have",
                     where=obj.name,
                 )
     return report
@@ -618,13 +685,13 @@ def diagnose_all(
         check_mapping(mapping, report)
         if skeleton is not None:
             check_side_swaps(mapping, skeleton, report)
-        check_mirrored_limbs(mapping, [], correction, report)
+        check_mirrored_limbs(mapping, correction, report)
     if parsed is not None:
         check_anp3(parsed, report)
         check_upside_down(parsed, report)
         check_quaternions(parsed, report)
         check_reversed_joints(parsed, skeleton, report)
-        check_axis_convention(parsed, report)
+        check_axis_convention(parsed, skeleton, report)
         if skeleton is not None:
             check_hanim_ids(parsed, skeleton, report)
     return report
@@ -632,6 +699,7 @@ def diagnose_all(
 
 __all__ = [
     "Defect",
+    "check_axis_convention",
     "check_quaternions",
     "Finding",
     "DiagnosticReport",
